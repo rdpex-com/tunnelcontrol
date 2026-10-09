@@ -1,0 +1,55 @@
+#!/bin/bash
+
+LOGFILE="/var/log/tun.log"
+VERBOSE_LOG="/var/log/tun.verbose.log"
+export LOGFILE VERBOSE_LOG
+
+if [ "${BASH_SOURCE[1]}" ]; then
+    CALLER_SCRIPT="$(basename "${BASH_SOURCE[1]}")"
+else
+    CALLER_SCRIPT="$(basename "$0")"
+fi
+
+#CALLER_NAME="${CALLER_SCRIPT%.*}" # Remove file extension if present
+CALLER_NAME="${CALLER_SCRIPT}"
+CALLER_NAME="${CALLER_NAME^^}"
+
+LOG() {
+    local level="$1"
+    shift
+    local message="$*"
+    local threshold=${LOG_LEVEL:-1}
+    local tag=$level
+    local line
+
+    [[ $threshold =~ ^[0-9]+$ ]] || threshold=1
+    [ "$level" = "NOTICE" ] && tag=INFO
+    line="[$(date '+%Y-%m-%d %H:%M:%S')] [${CALLER_NAME}][${tag}] ${message}"
+
+    case "$level" in
+        ERROR)
+            echo "$line" | tee -a "$LOGFILE" >&2
+            ;;
+        WARN)
+            echo "$line" | tee -a "$LOGFILE"
+            ;;
+        INFO)
+            [ "$threshold" -ge 2 ] || return 0
+            echo "$line"
+            ;;
+        DEBUG)
+            [ "$threshold" -ge 3 ] || return 0
+            ;;
+        *)
+            [ "$threshold" -ge 1 ] || return 0
+            echo "$line" | tee -a "$LOGFILE"
+            ;;
+    esac
+
+    if [ "$threshold" -ge 2 ]; then
+        echo "$line" >> "$VERBOSE_LOG"
+    fi
+    return 0
+}
+
+export -f LOG

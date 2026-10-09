@@ -1,0 +1,250 @@
+body {
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+}
+
+html.light, html:not(.dark) {
+    --tw-bg-opacity: 1;
+}
+
+/* Force the dark: styles to refresh */
+html.dark * {
+    transition: background-color 0.1s, color 0.1s, border-color 0.1s;
+}
+
+/* Tabs */
+.tab-button {
+    color: #6b7280;
+    border-bottom: 3px solid transparent;
+    background: none;
+    font-weight: 500;
+}
+
+.dark .tab-button {
+    color: #9ca3af;
+}
+
+.tab-button:hover {
+    color: #d1d5db;
+}
+
+.tab-active {
+    color: #000 !important;
+    border-bottom: 3px solid #3b82f6 !important;
+    background: none;
+}
+
+.dark .tab-active {
+    color: #ffffff !important;
+}
+
+#logs-content {
+    white-space: pre-wrap;
+    word-break: break-all;
+    overflow-wrap: break-word;
+    padding-bottom: 4px;
+    line-height: 1.4;
+}
+
+#logs-content:empty::after,
+#logs-content::after {
+    content: none;
+}
+
+/* Bottom Navigation */
+#bottom-nav {
+    padding-bottom: env(safe-area-inset-bottom);
+}
+
+@supports (-webkit-touch-callout: none) {
+    #bottom-nav {
+        padding-bottom: calc(env(safe-area-inset-bottom) + 8px);
+    }
+}
+
+.bottom-nav-btn {
+    transition: all 0.15s ease;
+}
+
+.bottom-nav-btn.active {
+    color: #60a5fa !important;
+}
+
+.bottom-nav-btn.active i {
+    transform: scale(1.1);
+}
+
+.bottom-nav-btn span {
+    font-size: 9.5px;
+    letter-spacing: 0.2px;
+}
+
+.bottom-nav-btn i {
+    font-size: 1.20rem;
+}
+
+@supports (-webkit-touch-callout: none) {
+    .ios #content-container {
+        padding-bottom: 77px !important;
+    }
+    .ios-pwa #content-container {
+        padding-bottom: 44px !important;
+    }
+}
+
+#tab-content {
+    padding-bottom: 3px;
+}
+
+#content-container {
+    max-height: calc(100vh - 55px);
+}
+
+/* Styled scrollbar for containers with the .allow-scroll class */
+.allow-scroll {
+    overflow-y: auto;
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: #9ca3af transparent;
+}
+
+.allow-scroll.has-scrollbar {
+    padding-right: 8px;
+}
+
+.allow-scroll::-webkit-scrollbar {
+    width: 5px;
+}
+
+.allow-scroll::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.allow-scroll::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.7);
+    border-radius: 9999px;
+}
+
+.allow-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(100, 116, 139, 0.9);
+}
+
+/* Dark mode */
+.dark .allow-scroll {
+    scrollbar-color: #4b5563 transparent;
+}
+
+.dark .allow-scroll::-webkit-scrollbar-thumb {
+    background: rgba(75, 85, 99, 0.85);
+}
+
+.dark .allow-scroll::-webkit-scrollbar-thumb:hover {
+    background: rgba(107, 114, 128, 0.95);
+}
+
+.desktop #dashboard-container {
+    min-height: calc(100vh - 426px);
+    height: calc(100vh - 426px);
+}
+
+#config-container, #logs-container, #system-container {
+    min-height: calc(100vh - 230px);
+    max-height: calc(100vh - 230px);
+}
+
+@supports (-webkit-touch-callout: none) {
+    .ios #config-container, .ios #logs-container, .ios #system-container {
+        min-height: calc(100vh - 282px);
+        max-height: calc(100vh - 282px);
+    }
+
+    .ios-pwa #config-container, .ios-pwa #logs-container, .ios-pwa #system-container {
+        min-height: calc(100vh - 242px);
+        max-height: calc(100vh - 242px);
+    }
+}
+
+.desktop #config-container, .desktop #logs-container, .desktop #system-container {
+    min-height: calc(100vh - 420px);
+    max-height: calc(100vh - 420px);
+}
+
+.desktop .dashboard-active #system-info {
+    margin-top: 30px !important;
+}
+
+html {
+    color-scheme: light only !important;
+}
+
+@media (prefers-color-scheme: dark) {
+    .dark\:* {
+        all: unset !important;
+    }
+}
+
+.desktop .custom-tooltip {
+    position: fixed;           /* ← important: fixed, not absolute */
+    pointer-events: none;
+    background: #1f2937;
+    border: 1px solid #4b5563;
+    border-radius: 6px;
+    padding: 10px 14px;
+    color: #e5e7eb;
+    font-size: 13px;
+    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.3);
+    display: none;
+    z-index: 1000;            /* higher */
+    width: auto;              /* auto works better */
+    min-width: 190px;
+    max-width: 260px;
+    min-height: 55px;
+    white-space: nowrap;
+    transition: opacity 0.1s;
+}
+
+.mobile .custom-tooltip {
+    margin: 0 auto;
+    min-width: 50%;
+    max-width: 60%;
+    pointer-events: none;
+    color: #e5e7eb;
+    font-size: 13px;
+    display: none;
+    z-index: 100;
+    align-items: anchor-center;
+    margin-bottom: -8px;
+}
+
+#background-overlay {
+    display: none !important;
+}
+
+#background-overlay.offline-overlay {
+    background-color: rgba(0, 0, 0, 0.45) !important;
+    z-index: 9999 !important;
+    pointer-events: none !important;
+    transition: background-color 0.4s ease !important;
+    display: block !important;
+}
+
+.light {
+  --offline-color: #6b7280;
+}
+
+.dark {
+  --offline-color: #9ca3af;
+}
+
+.offline-icon {
+  color: var(--offline-color);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 42px;
+  height: 42px;
+}
+
+.mobile:not(.layout-ready) #content-container {
+    visibility: hidden;
+}

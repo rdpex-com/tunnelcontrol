@@ -1,0 +1,32 @@
+#!/bin/bash
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+PID_FILE=${1}
+
+source ./tun.logger
+
+trap '' TSTP
+
+if [[ ! -t 0 ]]; then
+    trap '' TTIN TTOU
+fi
+
+while true; do
+    if [ -f "${DATA_PATH}/tun_stop" ]; then
+        LOG INFO "Skipping by external signal..."
+        exit 0
+    fi
+
+    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
+        LOG NOTICE "Tun daemon died unexpectedly. Restarting..."
+
+        nohup ./tun --restart >/dev/null 2>&1 &
+        exit 0
+    fi
+
+    sleep 2
+done

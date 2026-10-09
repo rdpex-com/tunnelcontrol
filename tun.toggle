@@ -1,0 +1,66 @@
+#!/bin/bash
+# tun.toggle [host]
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+HOST=${1:-}
+
+mapfile -t HOSTS < <(sed -n 's/^[[:space:]]*"\([^":[:space:]]*\):.*/\1/p' ./tun.config | awk '!seen[$0]++')
+
+host_enabled() {
+    [ -f "${DATA_PATH}/tun_host_$1_enabled" ] || [ ! -f "${DATA_PATH}/tun_host_$1_disabled" ]
+}
+
+active_enabled_hosts() {
+    local state_file id host
+    for state_file in "${DATA_PATH}"/tun_state_*; do
+        [ -f "$state_file" ] || continue
+        id=${state_file##*tun_state_}
+        host=$(cut -d: -f1 "${DATA_PATH}/tun_host_${id}" 2>/dev/null)
+        [ -n "$host" ] || continue
+        [ -f "${DATA_PATH}/tun_host_${host}_disabled" ] && continue
+        grep -q '^ONLINE' "$state_file" && echo "$host"
+    done | sort -u | wc -l
+}
+
+if [ -z "$HOST" ]; then
+    echo "Usage: tun --toggle <host>"
+    for ENTRY in "${HOSTS[@]}"; do
+        if host_enabled "$ENTRY"; then
+            echo "  ${ENTRY}  enabled"
+        else
+            echo "  ${ENTRY}  disabled"
+        fi
+    done
+    exit 0
+fi
+
+if ! printf '%s\n' "${HOSTS[@]}" | grep -qxF -- "$HOST"; then
+    echo "Unknown host ${HOST}: it is not in TUNNELS in tun.config"
+    exit 1
+fi
+
+PID=$(cat "${DATA_PATH}/tun_pid" 2>/dev/null)
+if ! [[ $PID =~ ^[0-9]+$ ]] || ! kill -0 "$PID" 2>/dev/null; then
+    echo "The tunnels are not running"
+    exit 1
+fi
+
+if host_enabled "$HOST"; then
+    if [ "$(active_enabled_hosts)" -le 1 ]; then
+        echo "Cannot disable the last active host. At least one host must remain enabled."
+        exit 1
+    fi
+    rm -f "${DATA_PATH}/tun_host_${HOST}_enabled"
+    : > "${DATA_PATH}/tun_host_${HOST}_disabled"
+    echo "Host ${HOST} disabled"
+else
+    rm -f "${DATA_PATH}/tun_host_${HOST}_disabled"
+    : > "${DATA_PATH}/tun_host_${HOST}_enabled"
+    echo "Host ${HOST} enabled"
+fi

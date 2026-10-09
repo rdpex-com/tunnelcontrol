@@ -1,0 +1,103 @@
+#!/bin/bash
+# tun.post.balance <tun> <local_peer> <remote_peer> <weight> <tunnel_count>
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+source ./tun.logger
+source ./tun.env
+
+TUN=${1}
+LOCAL_PEER=${2}
+REMOTE_PEER=${3}
+WEIGHT=${4}
+TUNNEL_COUNT=${5}
+CONFIG=${6}
+
+if [ -z "$WEIGHT" ]; then
+    LOG INFO "[${TUN}] ERROR: Weight not specified for balance mode."
+    exit 1
+fi
+
+IFS=':' read -r IFACE NETWORK <<< "$CONFIG"
+
+CONFIGURE_LOCK_DIR="${DATA_PATH}/tun_configure_${TUN}.lock"
+
+acquire_lock() {
+    while ! mkdir "$CONFIGURE_LOCK_DIR" 2>/dev/null; do
+        if [ -f "${DATA_PATH}/tun_stop" ]; then
+            LOG INFO "Skipping by external signal..."
+            exit 0
+        fi
+        LOG INFO "[${TUN}] WAITING LOCK ($PPID)"
+        sleep 0.1
+    done
+    LOG INFO "[${TUN}] ACQUIRE LOCK ($PPID)"
+}
+
+release_lock() {
+    rmdir "$CONFIGURE_LOCK_DIR" 2>/dev/null || true
+    LOG INFO "[${TUN}] RELEASE LOCK ($PPID)"
+}
+
+trap 'release_lock' EXIT
+
+acquire_lock
+
+LOG INFO "[${TUN}] Balance mode: Configuring tunnel to ${REMOTE_PEER} (weight ${WEIGHT})"
+
+echo "$WEIGHT" > "${DATA_PATH}/tun_weight_${TUN}"
+LOG INFO "[${TUN}] Weight ${WEIGHT} saved for tunnel"
+
+iptables -t nat -D POSTROUTING -s "${NETWORK}" ! -d "${NETWORK}" -o "tun${TUN}" -j MASQUERADE 2>/dev/null || true
+iptables -t nat -A POSTROUTING -s "${NETWORK}" ! -d "${NETWORK}" -o "tun${TUN}" -j MASQUERADE 2>/dev/null || true
+
+iptables -D FORWARD -o "tun${TUN}" -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
+iptables -D FORWARD -o "tun${TUN}" -j DROP 2>/dev/null || true
+
+LOG INFO "[${TUN}] Outgoing traffic on tunnel allowed"
+
+iptables -D FORWARD -i "${IFACE}" -o "tun${TUN}" -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null || true
+iptables -A FORWARD -i "${IFACE}" -o "tun${TUN}" -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i "tun${TUN}" -o "${IFACE}" -j ACCEPT 2>/dev/null || true
+iptables -A FORWARD -i "tun${TUN}" -o "${IFACE}" -j ACCEPT 2>/dev/null || true
+
+LIMIT="${SHAPING_RATE}"
+
+LOG INFO "[${TUN}] Applying $LIMIT limit on tunnel"
+
+tc qdisc del dev "tun${TUN}" root 2>/dev/null || true
+tc qdisc del dev "tun${TUN}" ingress 2>/dev/null || true
+tc qdisc del dev "ifb${TUN}" root 2>/dev/null || true
+
+ip link add "ifb${TUN}" type ifb 2>/dev/null || true
+ip link set dev "ifb${TUN}" up mtu 1500 2>/dev/null || true
+
+tc qdisc add dev "tun${TUN}" root handle 1: tbf rate "$LIMIT" burst "${SHAPING_BURST}" latency "${SHAPING_LATENCY}" 2>/dev/null || true
+
+tc qdisc add dev "tun${TUN}" handle ffff: ingress 2>/dev/null || true
+tc filter add dev "tun${TUN}" parent ffff: protocol all u32 match u32 0 0 flowid 1:1 action mirred egress redirect dev "ifb${TUN}" 2>/dev/null || true
+
+tc qdisc add dev "ifb${TUN}" root handle 1: tbf rate "$LIMIT" burst "${SHAPING_BURST}" latency "${SHAPING_LATENCY}" 2>/dev/null || true
+
+TABLE=$((100 + TUN))   # 101 for tun1, 102 for tun2 and so on
+
+LOG INFO "[${TUN}] Setting up policy routing for tunnel (source ${LOCAL_PEER} → table ${TABLE})"
+
+ip rule del to "${REMOTE_PEER}" lookup "${TABLE}" prio 90 2>/dev/null || true
+ip rule del from "${LOCAL_PEER}" lookup "${TABLE}" prio 91 2>/dev/null || true
+
+ip route flush table "${TABLE}" 2>/dev/null || true
+
+ip rule add to "${REMOTE_PEER}" lookup "${TABLE}" prio 90 2>/dev/null || true
+ip rule add from "${LOCAL_PEER}" lookup "${TABLE}" prio 91 2>/dev/null || true
+
+ip route replace default via "${REMOTE_PEER}" dev "tun${TUN}" table "${TABLE}" 2>/dev/null || true
+
+./tun.post.balance.routing "add" "$TUN" "$TUNNEL_COUNT" "$CONFIG" 2>/dev/null || true
+
+ip neigh flush dev "tun${TUN}" 2>/dev/null || true
+
+LOG INFO "[${TUN}] Balance mode: tunnel added with weight ${WEIGHT}"

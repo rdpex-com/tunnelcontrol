@@ -1,0 +1,148 @@
+#!/bin/bash
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+WORKING_DIR="${1:-$(dirname "$(readlink -f "$0")")}"
+SERVICE_NAME="tun-web.service"
+SYSTEMD_PATH="/etc/systemd/system/${SERVICE_NAME}"
+SERVICE_FILE="${WORKING_DIR}/${SERVICE_NAME}"
+
+CERT_PATH="${DATA_PATH}/cert"
+
+NODE_MIN_MAJOR=20
+NODE_INSTALL_MAJOR=22
+
+source ./tun.logger
+source ./tun.env
+
+apt_progress() {
+    local label=$1 line pct verb eta status
+    local eta_re='\(([^)]*remaining)\)'
+    local -a field
+    shift
+    if [ ! -t 1 ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get -qq "$@" > /dev/null 2>&1
+        return
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get -o APT::Status-Fd=3 "$@" 3>&1 > /dev/null 2>&1 | while IFS= read -r line; do
+        IFS=: read -ra field <<< "$line"
+        case "${field[0]:-}" in
+            dlstatus) verb=Downloading; pct=${field[2]:-} ;;
+            pmstatus) verb=Installing; pct=${field[2]:-}; [[ $pct =~ ^[0-9] ]] || pct=${field[3]:-} ;;
+            *) continue ;;
+        esac
+        [[ $pct =~ ^[0-9] ]] || continue
+        eta=""
+        [[ $line =~ $eta_re ]] && eta=" (${BASH_REMATCH[1]})"
+        printf '\r\033[K%s %s: %s%%%s' "$verb" "$label" "${pct%%.*}" "$eta"
+    done
+    status=${PIPESTATUS[0]}
+    printf '\r\033[K'
+    return "$status"
+}
+
+apt_install() {
+    apt_progress "package lists" update && apt_progress "$*" install -y "$@"
+}
+
+npm_install() {
+    local log pid status count total package
+    local -a packages
+    log=$(mktemp)
+    rm -rf "${WORKING_DIR}/web/node_modules"
+    (cd "${WORKING_DIR}/web" && exec npm ci --omit=dev --no-audit --no-fund) > "$log" 2>&1 &
+    pid=$!
+    if [ -t 1 ]; then
+        mapfile -t packages < <(cd "${WORKING_DIR}/web" && node -e 'for (const [name, entry] of Object.entries(require("./package-lock.json").packages)) if (name && !entry.dev) console.log(name)' 2>/dev/null)
+        total=${#packages[@]}
+        while kill -0 "$pid" 2>/dev/null; do
+            count=0
+            for package in "${packages[@]}"; do
+                [ -f "${WORKING_DIR}/web/${package}/package.json" ] && count=$((count + 1))
+            done
+            [ "$total" -gt 0 ] && printf '\r\033[KInstalling web panel packages: %d%%' $((count * 100 / total))
+            sleep 1
+        done
+        printf '\r\033[K'
+    fi
+    wait "$pid"
+    status=$?
+    NPM_OUTPUT=$(cat "$log")
+    rm -f "$log"
+    return "$status"
+}
+
+NODE_MAJOR=$(node -v 2>/dev/null | sed -n 's/^v\([0-9]*\).*/\1/p')
+if [ "${NODE_MAJOR:-0}" -lt "${NODE_MIN_MAJOR}" ]; then
+    LOG NOTICE "Installing Node.js ${NODE_INSTALL_MAJOR} from NodeSource (installed: ${NODE_MAJOR:-none}, required: ${NODE_MIN_MAJOR}+)..."
+    if ! apt_install curl gnupg ca-certificates; then
+        LOG ERROR "Failed to install curl, gnupg and ca-certificates"
+        exit 1
+    fi
+    mkdir -p /etc/apt/keyrings
+    if ! curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
+            | gpg --dearmor --yes -o /etc/apt/keyrings/nodesource.gpg; then
+        LOG ERROR "Failed to get the NodeSource signing key"
+        exit 1
+    fi
+    echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_INSTALL_MAJOR}.x nodistro main" \
+        > /etc/apt/sources.list.d/nodesource.list
+    if ! apt_install nodejs; then
+        LOG ERROR "Failed to install Node.js from NodeSource"
+        exit 1
+    fi
+fi
+
+if ! command -v openssl > /dev/null 2>&1 && ! apt_install openssl; then
+    LOG ERROR "Failed to install openssl"
+    exit 1
+fi
+
+LOG NOTICE "Installing web panel packages (Node.js $(node -v))..."
+if ! npm_install; then
+    LOG ERROR "npm ci failed: $(echo "${NPM_OUTPUT}" | tail -n 5)"
+    exit 1
+fi
+
+if [ ! -f "${CERT_PATH}/privkey.pem" ] || [ ! -f "${CERT_PATH}/fullchain.pem" ]; then
+    CERT_ADDRESS="${WEB_CERT_ADDRESS}"
+    if [ -z "${CERT_ADDRESS}" ]; then
+        IFACE=$(sed -n 's/^[[:space:]]*CONFIG="\([^:"]*\):.*/\1/p' ./tun.config | tail -n 1)
+        CERT_ADDRESS=$(ip -4 -o addr show dev "${IFACE}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)
+    fi
+    if [ -z "${CERT_ADDRESS}" ]; then
+        LOG ERROR "Cannot determine the web panel address for its certificate: set WEB_CERT_ADDRESS in tun.config"
+        exit 1
+    fi
+
+    if [[ ${CERT_ADDRESS} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        CERT_NAMES="DNS:${CERT_ADDRESS},IP:${CERT_ADDRESS}"
+    else
+        CERT_NAMES="DNS:${CERT_ADDRESS}"
+    fi
+
+    LOG NOTICE "Creating the web panel certificate for ${CERT_ADDRESS}..."
+
+    [ -d "${CERT_PATH}" ] || { mkdir -p "$(dirname "${CERT_PATH}")" && mkdir -m 700 "${CERT_PATH}"; }
+    if ! OPENSSL_OUTPUT=$(openssl req -x509 -nodes -days "${WEB_CERT_DAYS}" -newkey rsa:2048 \
+            -keyout "${CERT_PATH}/privkey.pem" -out "${CERT_PATH}/fullchain.pem" \
+            -subj "/CN=${CERT_ADDRESS}" -addext "subjectAltName = ${CERT_NAMES}" 2>&1); then
+        LOG ERROR "Creating the web panel certificate failed: ${OPENSSL_OUTPUT}"
+        exit 1
+    fi
+fi
+
+LOG INFO "Installing service ${SERVICE_NAME}..."
+
+rm -f "${SYSTEMD_PATH}"
+sed "s|@DIR@|${WORKING_DIR}|g" "${SERVICE_FILE}" > "${SYSTEMD_PATH}"
+
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}"
+systemctl restart "${SERVICE_NAME}"
+
+LOG NOTICE "Service ${SERVICE_NAME} installed, enabled and started."
+LOG INFO "Working directory: ${WORKING_DIR}"

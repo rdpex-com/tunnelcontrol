@@ -1,0 +1,61 @@
+#!/bin/bash
+# tun.post.balance.remove <mode> <tun> [remote_peer] [tunnel_count] [config]
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+source ./tun.logger
+
+TUN=${1}
+REMOTE_PEER=${2}
+CONFIG=${4}
+
+IFS=':' read -r IFACE NETWORK <<< "$CONFIG"
+
+CONFIGURE_LOCK_DIR="${DATA_PATH}/tun_configure_${TUN}.lock"
+
+acquire_lock() {
+    while ! mkdir "$CONFIGURE_LOCK_DIR" 2>/dev/null; do
+        if [ -f "${DATA_PATH}/tun_stop" ]; then
+            LOG INFO "Skipping by external signal..."
+            exit 0
+        fi
+        LOG INFO "[${TUN}] WAITING LOCK ($PPID)"
+        sleep 0.1
+    done
+    LOG INFO "[${TUN}] ACQUIRE LOCK ($PPID)"
+}
+
+release_lock() {
+    rmdir "$CONFIGURE_LOCK_DIR" 2>/dev/null || true
+    LOG INFO "[${TUN}] RELEASE LOCK ($PPID)"
+}
+
+trap 'release_lock' EXIT
+
+acquire_lock
+
+LOG INFO "[${TUN}] Balance mode: Full removing..."
+
+tc qdisc del dev "tun${TUN}" root 2>/dev/null || true
+tc qdisc del dev "tun${TUN}" ingress 2>/dev/null || true
+tc qdisc del dev "ifb${TUN}" root 2>/dev/null || true
+ip link del "ifb${TUN}" 2>/dev/null || true
+
+iptables -t nat -D POSTROUTING -s "${NETWORK}" ! -d "${NETWORK}" -o "tun${TUN}" -j MASQUERADE 2>/dev/null || true
+iptables -D FORWARD -i "${IFACE}" -o "tun${TUN}" -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -i "tun${TUN}" -o "${IFACE}" -j ACCEPT 2>/dev/null || true
+iptables -D FORWARD -o "tun${TUN}" -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
+iptables -D FORWARD -o "tun${TUN}" -j DROP 2>/dev/null || true
+iptables -I FORWARD 1 -o "tun${TUN}" -j DROP 2>/dev/null || true
+
+conntrack -D --reply-src "$REMOTE_PEER" 2>/dev/null || true
+conntrack -D --reply-dst "$REMOTE_PEER" 2>/dev/null || true
+conntrack -D --orig-dst "$REMOTE_PEER" 2>/dev/null || true
+conntrack -D --orig-src "$REMOTE_PEER" 2>/dev/null || true
+
+touch "${DATA_PATH}/tun_removed_${TUN}" 
+
+LOG INFO "[${TUN}] Balance mode: Tunnel fully removed"

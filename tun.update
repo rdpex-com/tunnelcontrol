@@ -1,0 +1,74 @@
+#!/bin/bash
+# tun.update
+
+{
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+source ./tun.logger
+source ./tun.env
+
+fail() {
+    LOG ERROR "Update: $*"
+    exit 1
+}
+
+if [ -d .git ]; then
+    LOG INFO "Update: checking the git repository..."
+
+    git fetch --quiet || fail "git fetch failed"
+    UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || fail "the current branch has no upstream to update from"
+
+    if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$UPSTREAM")" ]; then
+        LOG NOTICE "Update: already up to date ($(git log -1 --format=%h))"
+        exit 0
+    fi
+
+    git merge-base --is-ancestor HEAD "$UPSTREAM" || fail "local commits differ from ${UPSTREAM}, a fast-forward update is not possible"
+    git diff --quiet HEAD || fail "tracked files have local changes; commit or revert them first"
+
+    FROM=$(git log -1 --format=%h)
+    TO=$(git log -1 --format=%h "$UPSTREAM")
+
+    ./tun --stop < /dev/null > /dev/null 2>&1
+
+    git merge --ff-only --quiet "$UPSTREAM" || fail "git merge failed; run tun --install to start the tunnels again"
+    LOG NOTICE "Update: code updated ${FROM} -> ${TO}"
+else
+    [ -n "${UPDATE_URL}" ] || fail "UPDATE_URL is empty"
+
+    CURRENT=$(cat ./VERSION 2>/dev/null || true)
+    LATEST=$(curl -fsSL "${UPDATE_URL}/VERSION") || fail "cannot get the latest version from ${UPDATE_URL}/VERSION"
+    [[ $LATEST =~ ^[0-9]+(\.[0-9]+)+$ ]] || fail "unexpected answer from ${UPDATE_URL}/VERSION"
+
+    if [ "$LATEST" = "$CURRENT" ]; then
+        LOG NOTICE "Update: already up to date (${CURRENT})"
+        exit 0
+    fi
+
+    TMP=$(mktemp -d)
+    trap 'rm -rf "$TMP"' EXIT
+
+    LOG NOTICE "Update: downloading version ${LATEST}..."
+    CURL_PROGRESS=--silent
+    [ -t 2 ] && CURL_PROGRESS=--progress-bar
+    curl -fSL "$CURL_PROGRESS" "${UPDATE_URL}/tunnelcontrol.tar.gz" -o "$TMP/release.tar.gz" || fail "download failed"
+
+    mkdir "$TMP/src"
+    tar -xzf "$TMP/release.tar.gz" -C "$TMP/src" --strip-components=1 2>/dev/null || fail "the download is not a valid archive"
+    if [ ! -f "$TMP/src/tun" ] || [ ! -f "$TMP/src/tun.defaults" ] || [ ! -d "$TMP/src/web" ]; then
+        fail "the archive does not look like a Tunnel Control release"
+    fi
+    [ "$(cat "$TMP/src/VERSION" 2>/dev/null)" = "$LATEST" ] || fail "the archive is not version ${LATEST}"
+    for USER_FILE in tun.config .data_path data bak; do
+        [ -e "$TMP/src/$USER_FILE" ] && fail "the archive contains the user item ${USER_FILE}"
+    done
+
+    ./tun --stop < /dev/null > /dev/null 2>&1
+
+    cp -a "$TMP/src/." ./ || fail "copying the new code failed; run tun --install to start the tunnels again"
+    rm -rf "$TMP"
+    LOG NOTICE "Update: code updated ${CURRENT:-unknown} -> ${LATEST}"
+fi
+
+exec ./tun --install
+}

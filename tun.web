@@ -1,0 +1,24 @@
+#!/bin/bash
+
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+source ./tun.env
+
+DATA_PATH=$(cat ./.data_path 2>/dev/null)
+if [ -z "${DATA_PATH}" ]; then
+    DATA_PATH=$(sed -n 's/^[[:space:]]*DATA_PATH="\{0,1\}\([^"#[:space:]]*\)"\{0,1\}.*/\1/p' ./tun.config 2>/dev/null | tail -n 1)
+fi
+
+USE_HTTPS="false"
+[ "${WEB_HTTPS}" = "1" ] && USE_HTTPS="true"
+
+export DATA_PATH="${DATA_PATH:-./data}"
+export NODE_ENV=production
+export HOST="${WEB_LISTEN}"
+export PORT="${WEB_HTTP_PORT}"
+export USE_HTTPS
+export HTTPS_PORT="${WEB_HTTPS_PORT}"
+export LOG_LEVEL
+
+cd web || exit 1
+exec node server.js

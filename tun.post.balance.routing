@@ -1,0 +1,146 @@
+#!/bin/bash
+# tun.post.balance.routing <mode> <tun> <config> <mode>
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+source ./tun.logger
+source ./tun.env
+
+MODE=${1:-add}
+TUN=${2}
+TUNNEL_COUNT=${3}
+CONFIG=${4}
+DROP_NEW=${5}
+
+IFS=':' read -r IFACE _ <<< "$CONFIG"
+
+ROUTING_LOCK_DIR="${DATA_PATH}/tun_routing_rebuild.lock"
+
+acquire_lock() {
+    while ! mkdir "$ROUTING_LOCK_DIR" 2>/dev/null; do
+        if [ -f "${DATA_PATH}/tun_stop" ]; then
+            LOG INFO "Skipping by external signal..."
+            exit 0
+        fi
+        LOG INFO "[${TUN}] WAITING LOCK ($PPID)"
+        sleep 0.1
+    done
+    LOG INFO "[${TUN}] ACQUIRE LOCK ($PPID)"
+}
+
+release_lock() {
+    rmdir "$ROUTING_LOCK_DIR" 2>/dev/null || true
+    LOG INFO "[${TUN}] RELEASE LOCK ($PPID)"
+}
+
+trap 'release_lock' EXIT
+
+acquire_lock
+
+if [ "$MODE" = "remove" ]; then
+    LOG INFO "[${TUN}] Balance mode: Removing tunnel from multipath... ($TUNNEL_COUNT)"
+    if [ "$DROP_NEW" = "drop" ]; then
+        iptables -D FORWARD -o "tun${TUN}" -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
+        iptables -I FORWARD 1 -o "tun${TUN}" -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
+    fi
+else
+    LOG INFO "[${TUN}] Balance mode: Adding tunnel to multipath... ($TUNNEL_COUNT)"
+    if [ "$DROP_NEW" = "drop" ]; then
+        iptables -D FORWARD -o "tun${TUN}" -m conntrack --ctstate NEW -j DROP 2>/dev/null || true
+    fi
+fi
+
+ACTIVE_NEXTHOPS=""
+
+declare -A HOST_CONFIGURED
+declare -A HOST_LIVE
+
+for t in $(seq 1 "$TUNNEL_COUNT"); do
+    TUNNEL_HOST="${DATA_PATH}/tun_host_${t}"
+    if [ ! -f "${TUNNEL_HOST}" ]; then
+        continue
+    fi
+    HOST=$(cut -d: -f1 "${TUNNEL_HOST}")
+
+    if [ "$MODE" = "remove" ] && [ "$TUN" = "$t" ]; then
+        HOST_CONFIGURED["$HOST"]+="$t:HOLE "
+        continue
+    fi
+
+    if [ -f "${DATA_PATH}/tun_rotation_${t}" ]; then
+        ROTATION_STATE=$(cat "${DATA_PATH}/tun_rotation_${t}" 2>/dev/null || echo "0")
+        if [ "${ROTATION_STATE}" != "0" ]; then
+            LOG INFO "[${TUN}] Tunnel tun${t} is rotation, skipping..."
+            HOST_CONFIGURED["$HOST"]+="$t:HOLE "
+            continue
+        fi
+    fi
+
+    DISABLED_MARKER="${DATA_PATH}/tun_host_${HOST}_disabled"
+    if [ -f "${DISABLED_MARKER}" ]; then
+        LOG INFO "[${TUN}] Tunnel tun${t} is disabled, skipping..."
+        HOST_CONFIGURED["$HOST"]+="$t:HOLE "
+        continue
+    fi
+
+    if ip link show "tun${t}" >/dev/null 2>&1; then
+        REMOTE=$(ip addr show "tun${t}" | grep -o 'peer [0-9.]*' | awk '{print $2}' 2>/dev/null)
+        if [ -n "$REMOTE" ]; then
+            WEIGHT_NOW=$(cat "${DATA_PATH}/tun_weight_${t}" 2>/dev/null || echo "${SHAPING_DEFAULT_WEIGHT}")
+            HOST_CONFIGURED["$HOST"]+="$t:LIVE:$REMOTE:$WEIGHT_NOW "
+            HOST_LIVE["$HOST"]+="$t:$REMOTE:$WEIGHT_NOW "
+        else
+            HOST_CONFIGURED["$HOST"]+="$t:HOLE "
+        fi
+    else
+        HOST_CONFIGURED["$HOST"]+="$t:HOLE "
+    fi
+done
+
+for HOST in "${!HOST_CONFIGURED[@]}"; do
+    read -ra CONFIG_LIST <<< "${HOST_CONFIGURED[$HOST]}"
+    read -ra LIVE_LIST <<< "${HOST_LIVE[$HOST]:-""}"
+
+    if [ ${#LIVE_LIST[@]} -eq 0 ]; then
+        continue
+    fi
+
+    FINAL_LIST=()
+
+    for entry in "${CONFIG_LIST[@]}"; do
+        IFS=':' read -r t STATUS REMOTE WEIGHT <<< "$entry"
+
+        if [ "$STATUS" = "LIVE" ]; then
+            FINAL_LIST+=("nexthop via ${REMOTE} dev tun${t} weight ${WEIGHT}")
+        else
+            # Gap: take a random live tunnel of this host
+            rand_idx=$(( RANDOM % ${#LIVE_LIST[@]} ))
+            IFS=':' read -r lt lremote lweight <<< "${LIVE_LIST[$rand_idx]}"
+            FINAL_LIST+=("nexthop via ${lremote} dev tun${lt} weight ${lweight}")
+        fi
+    done
+
+    for item in "${FINAL_LIST[@]}"; do
+        ACTIVE_NEXTHOPS="${ACTIVE_NEXTHOPS} ${item}"
+    done
+done
+
+if [ -n "$ACTIVE_NEXTHOPS" ]; then
+    read -ra NEXTHOP_ARGS <<< "$ACTIVE_NEXTHOPS"
+    ip route replace default table 300 "${NEXTHOP_ARGS[@]}" 2>/dev/null || true
+    ip rule add iif "${IFACE}" table 300 priority 100 2>/dev/null || true
+    LOG INFO "[${TUN}] Multipath route updated: ${ACTIVE_NEXTHOPS}"
+else
+    LOG INFO "[${TUN}] Multipath route empty"
+fi
+
+ip neigh flush dev "tun${TUN}" 2>/dev/null || true
+
+if [ "$MODE" = "remove" ]; then
+    LOG INFO "[${TUN}] Balance mode: Tunnel removed from routing."
+else
+    LOG INFO "[${TUN}] Balance mode: Tunnel added to routing."
+fi

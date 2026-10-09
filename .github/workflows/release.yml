@@ -1,0 +1,26 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check that the tag matches VERSION
+        run: test "v$(cat VERSION)" = "${GITHUB_REF_NAME}"
+
+      - name: Build the archive
+        run: git -c tar.umask=0022 archive --format=tar.gz --prefix=tunnelcontrol/ -o tunnelcontrol.tar.gz HEAD
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${GITHUB_REF_NAME}" tunnelcontrol.tar.gz install.sh VERSION --title "Tunnel Control ${GITHUB_REF_NAME}" --generate-notes

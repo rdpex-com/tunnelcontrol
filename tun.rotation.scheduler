@@ -1,0 +1,705 @@
+#!/bin/bash
+# tun.rotation.scheduler
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+CONFIG="${!#}"
+
+set -- "${@:1:$(($# - 1))}"
+
+source ./tun.logger
+source ./tun.env
+
+LOG INFO "Centralized rotation scheduler started, Log level: ${LOG_LEVEL:-1}"
+
+trap '' TSTP
+
+if [[ ! -t 0 ]]; then
+    trap '' TTIN TTOU
+fi
+
+# ====================== SETTINGS ======================
+ROTATE=${ROTATION_DELAY}
+MIN_CHANNEL_INTERVAL=${ROTATION_MIN_CHANNEL_INTERVAL}
+MIN_STABLE_TIME=${ROTATION_MIN_STABLE_TIME}
+CYCLE_COUNT=${ROTATION_CYCLE_COUNT}
+MIN_UNIQUE_HOSTS=${ROTATION_MIN_UNIQUE_HOSTS}
+ACTIVE_HOSTS_ONLY=${ROTATION_ACTIVE_HOSTS_ONLY}
+
+TRAFFIC_DRAIN_TIMEOUT=${ROTATION_DRAIN_TIMEOUT}
+TRAFFIC_DRAIN_GRACE=${ROTATION_DRAIN_GRACE}
+TRAFFIC_DRAIN_THRESHOLD=${ROTATION_DRAIN_THRESHOLD}
+
+ON_DRAIN_TIMEOUT="${ROTATION_ON_DRAIN_TIMEOUT}"
+# =======================================================
+
+STOP_FILE="${DATA_PATH}/tun_stop"
+
+declare -A TUN_TO_HOST
+declare -A UNIQUE_HOSTS
+declare -gA LAST_STATES
+
+LOG DEBUG "config=$CONFIG"
+
+while [ $# -ge 2 ]; do
+    TUN=$1
+    HOST=$2
+    TUN_TO_HOST[$TUN]=$HOST
+    shift 2
+done
+
+for HOST in "${TUN_TO_HOST[@]}"; do
+    UNIQUE_HOSTS["$HOST"]=1
+done
+
+for HOST in "${!UNIQUE_HOSTS[@]}"; do
+    LOG INFO "Unique host: $HOST"
+done
+
+for state in ONLINE OFFLINE; do
+    LAST_STATES[$state]=""
+done
+
+LOG INFO "Loaded ${#TUN_TO_HOST[@]} tunnel(s) at ${#UNIQUE_HOSTS[@]} host(s) for scheduling"
+
+check_last_states_change() {
+    local result=0
+    local now
+    now=$(date +%s)
+
+    for state in ONLINE OFFLINE; do
+        local file="${DATA_PATH}/tun_last_${state,,}"   # online / offline
+
+        if [ -f "$file" ]; then
+            local data
+            data=$(cat "$file" 2>/dev/null || echo "")
+            local last_data=${LAST_STATES[$state]}
+
+            if [ "$data" != "$last_data" ]; then
+                LOG DEBUG "State change detected for ${state}: '$data' ≠ '$last_data'"
+
+                LAST_STATES[$state]="$data"
+                IFS=':' read -r last_time last_tun <<< "$data"
+
+                if [ $((now - last_time)) -lt $MIN_STABLE_TIME ]; then
+                    LOG INFO "Channel tun${last_tun} went ${state,,} $((now - last_time))s ago during wait"
+                    result=1
+                fi
+            fi
+        fi
+    done
+    return $result
+}
+
+LAST_SKIP_ROTATION=""
+
+should_skip_rotation() {
+    local active_hosts=0
+    local disabled_hosts=0
+    local host
+    local result
+
+    for host in "${!UNIQUE_HOSTS[@]}"; do
+        if [ -f "${DATA_PATH}/tun_host_${host}_disabled" ] || [ -f "${DATA_PATH}/tun_host_${host}_busy" ]; then
+            disabled_hosts=$((disabled_hosts + 1))
+        else
+            active_hosts=$((active_hosts + 1))
+        fi
+    done
+
+    if [ "${ACTIVE_HOSTS_ONLY:-0}" -eq 1 ]; then
+        if [ "$active_hosts" -lt "$MIN_UNIQUE_HOSTS" ]; then
+            result=1
+        else
+            result=0
+        fi
+
+        if [ "${LAST_SKIP_ROTATION}" != "$result" ]; then
+            if [ "$result" -eq 1 ]; then
+                LOG DEBUG "Only ${active_hosts} active host(s) available. Skipping rotation logic."
+            else
+                LOG DEBUG "Active hosts meet the minimum requirement (${active_hosts} >= ${MIN_UNIQUE_HOSTS}). Proceeding with rotation logic."
+            fi
+            LAST_SKIP_ROTATION=$result
+        fi
+
+        return $result          # 0 or 1
+    fi
+
+    return 255                  # ACTIVE_HOSTS_ONLY is off, no effect
+}
+
+wait() {
+    local seconds=$1
+    local tun=$2
+    local i
+
+    for ((i=1; i<=seconds; i++)); do
+        if [ -f "${STOP_FILE}" ]; then
+            LOG INFO "Skipping by external signal..."
+            exit 0
+        fi
+
+        sleep 1
+        if [ -n "$tun" ]; then
+            if ! ip link show "tun${tun}" > /dev/null 2>&1; then
+                LOG DEBUG "Channel tun${tun} went offline during wait"
+                return 1
+            fi
+            
+            check_last_states_change
+            if [ $? -eq 1 ]; then
+                LOG DEBUG "State change detected during wait for tun${tun}"
+                return 1
+            fi
+
+            should_skip_rotation
+            if [ $? -eq 1 ]; then
+                LOG DEBUG "Skipping rotation due to insufficient active hosts"
+                return 1
+            fi
+        fi
+    done
+
+    return 0
+}
+
+wait_traffic_drain() {
+    local tun=$1
+    local max_wait=${2:-$TRAFFIC_DRAIN_TIMEOUT}
+    local grace=${3:-$TRAFFIC_DRAIN_GRACE}
+    local threshold=${4:-$TRAFFIC_DRAIN_THRESHOLD}
+
+    local prev_rx=0 prev_tx=0
+    local idle_count=0
+    local had_traffic=0
+
+    local i
+
+    LOG INFO "Traffic drain phase for tun${tun}: max wait ${max_wait}s, grace ${grace}s"
+
+    # Initial read of the counters
+    if ip link show "tun${tun}" >/dev/null 2>&1; then
+        local current
+        current=$(awk "/tun${tun}:/ {print \$2, \$10}" /proc/net/dev 2>/dev/null || echo "0 0")
+        read -r prev_rx prev_tx <<< "$current"
+    fi
+
+    for ((i=1; i<=max_wait; i++)); do
+        if [ -f "${STOP_FILE}" ]; then
+            LOG INFO "Skipping by external signal during traffic drain..."
+            exit 0
+        fi
+
+        if ! ip link show "tun${tun}" >/dev/null 2>&1; then
+            LOG DEBUG "tun${tun} went offline during traffic drain"
+            return 1
+        fi
+
+        local current cur_rx cur_tx delta
+        current=$(awk "/tun${tun}:/ {print \$2, \$10}" /proc/net/dev 2>/dev/null || echo "0 0")
+        read -r cur_rx cur_tx <<< "$current"
+
+        delta=$(( (cur_rx - prev_rx) + (cur_tx - prev_tx) ))
+
+        if [ "$delta" -lt "$threshold" ]; then
+            idle_count=$((idle_count + 1))
+            if [ "$idle_count" -ge "$grace" ]; then
+                LOG INFO "Traffic on tun${tun} became idle after ${i}s (grace reached). Safe to rotate."
+                return 0
+            fi
+        else
+            idle_count=0
+            had_traffic=1
+            LOG INFO "tun${tun} still active: +${delta} bytes in last second ($current)"
+        fi
+
+        prev_rx=$cur_rx
+        prev_tx=$cur_tx
+
+        sleep 1
+    done
+
+    if [ $had_traffic -eq 1 ]; then
+        LOG WARN "Traffic drain timeout reached for tun${tun} (${max_wait}s). Traffic is still present."
+        return 2
+    else
+        LOG INFO "Traffic drain timeout reached for tun${tun}, but no significant traffic was seen."
+        return 0
+    fi
+}
+
+get_last_rotate() {
+    local tun=$1
+    local file="${DATA_PATH}/tun_last_rotate_${tun}"
+
+    if [ -f "$file" ]; then
+        cat "$file"
+    else
+        echo 0
+    fi
+}
+
+get_last_online() {
+    if [ -f "${DATA_PATH}/tun_last_online" ]; then
+        awk -F: '{print $1}' "${DATA_PATH}/tun_last_online"
+    else
+        echo 0
+    fi
+}
+
+get_last_online_by_tun() {
+    local tun=$1
+    local file="${DATA_PATH}/tun_state_${tun}"
+
+    if [ -f "$file" ]; then
+        local status_time
+        status_time=$(cat "$file")
+        if [[ $status_time == ONLINE:* ]]; then
+            echo "${status_time#ONLINE:}"
+        else
+            echo 0
+        fi
+    else
+        echo 0
+    fi
+}
+
+get_avg_connect_duration() {
+    local tun=$1
+    local max_records=${2:-10}        # 10 records for the average
+
+    local file="${DATA_PATH}/tun_connect_duration_${tun}"
+    local sum=0
+    local count=0
+
+    if [ ! -f "$file" ]; then
+        echo 0
+        return
+    fi
+
+    # Read the last max_records lines and compute the average
+    while IFS= read -r duration && [ "$count" -lt "$max_records" ]; do
+        if [[ $duration =~ ^[0-9]+$ ]]; then
+            sum=$((sum + duration))
+            count=$((count + 1))
+        fi
+    done < <(tail -n "$max_records" "$file")
+
+    if [ $count -eq 0 ]; then
+        echo 0
+    else
+        echo $((sum / count))
+    fi
+}
+
+get_avg_connect_spread() {
+    local min_avg=999999
+    local max_avg=0
+    local has_data=0
+    local tun host avg
+
+    for tun in "${!TUN_TO_HOST[@]}"; do
+        host=${TUN_TO_HOST[$tun]}
+
+        if [ -d "${DATA_PATH}/tun_host_${host}.lock" ]; then
+            continue
+        fi
+
+        # Skip offline channels
+        if ! ip link show "tun${tun}" > /dev/null 2>&1; then
+            continue
+        fi
+
+        avg=$(get_avg_connect_duration "$tun" 5)
+        if [ "$avg" -gt 0 ]; then
+            has_data=1
+            if [ "$avg" -lt "$min_avg" ]; then
+                min_avg=$avg
+            fi
+            if [ "$avg" -gt "$max_avg" ]; then
+                max_avg=$avg
+            fi
+        fi
+    done
+
+    if [ $has_data -eq 0 ]; then
+        echo 0
+    else
+        echo $((max_avg - min_avg))
+    fi
+}
+
+get_skip_count() {
+    local tun=$1
+    local file="${DATA_PATH}/tun_skip_count_${tun}"
+
+    if [ -f "$file" ]; then
+        cat "$file"
+    else
+        echo 0
+    fi
+}
+
+increment_skip_count() {
+    local tun=$1
+    local file="${DATA_PATH}/tun_skip_count_${tun}"
+    local current
+    current=$(get_skip_count "$tun")
+    local new=$((current + 1))
+
+    if [ $new -gt $MAX_SKIP_COUNT ]; then
+        new=$MAX_SKIP_COUNT
+    fi
+    echo $new > "$file"
+    echo $new
+}
+
+reset_skip_count() {
+    local tun=$1
+    local file="${DATA_PATH}/tun_skip_count_${tun}"
+    if [ -n "$tun" ]; then
+        echo 0 > "$file" 2>/dev/null || true
+        LOG INFO "Skip count reset for tun${tun}"
+    else
+        rm -f "${DATA_PATH}/tun_skip_count_*" 2>/dev/null || true
+        LOG INFO "All skip counts reset"
+    fi
+}
+
+for TUN in "${!TUN_TO_HOST[@]}"; do
+    if [ ! -f "${DATA_PATH}/tun_skip_count_${TUN}" ]; then
+        echo 0 > "${DATA_PATH}/tun_skip_count_${TUN}"
+    fi
+done
+
+SOCKET=""
+
+tunnel_kill_by_tun() {
+    local tun=$1
+    local tunnel_stop="${DATA_PATH}/tun_stop_${tun}"
+    local SOCKET="${DATA_PATH}/tun_ssh_${tun}.sock"
+
+    if [ -f "${STOP_FILE}" ]; then
+        LOG INFO "Skipping by external signal..."
+        exit 0
+    fi
+
+    LOG INFO "Sending stop signal to tunnel ${tun}..."
+
+    touch "$tunnel_stop"
+
+    LOG INFO "Waiting up to 60 seconds for tunnel ${tun} to stop gracefully..."
+
+    local timeout=60
+    local start_time
+    start_time=$(date +%s)
+    local done=false
+
+    while true; do
+        local current_time
+        current_time=$(date +%s)
+        local elapsed=$((current_time - start_time))
+
+        if [ -f "${STOP_FILE}" ]; then
+            LOG INFO "Skipping by external signal..."
+            exit 0
+        fi
+
+        if [ $elapsed -ge $timeout ]; then
+            LOG WARN "Timeout reached (${timeout}s) for tunnel ${tun}"
+            break
+        fi
+
+        local status
+        status=$(cat "$tunnel_stop" 2>/dev/null)
+        if [ "$status" = "0" ] || [ "$status" = "1" ]; then
+            done=true
+            break
+        fi
+
+        sleep 1
+    done
+
+    if [ "$done" = true ]; then
+        LOG INFO "Tunnel ${tun} finished stopping gracefully."
+    else
+        LOG INFO "Tunnel ${tun} stop signal sent (may have been killed forcibly)."
+    fi
+
+    pkill -f "${SOCKET}" 2>/dev/null || true
+    pkill -f "ssh: ${SOCKET} \[mux\]" 2>/dev/null || true
+    pkill -f "ssh -w ${tun}:${tun}" 2>/dev/null || true
+
+    local stop_file="${DATA_PATH}/tun_stop"
+    if [ ! -f "${stop_file}" ]; then 
+        rm -f "$DATA_PATH/tun_stop_${tun}" 2>/dev/null || true
+    fi
+}
+
+format_bytes() {
+    local bytes=$1
+    local str_var=$2      # name of the string variable (for example TRX_STR)
+    local prefix=$3       # prefix for the string ("RX" or "TX")
+
+    local val unit str
+
+    export LC_NUMERIC=C
+
+    if [ "$bytes" -ge $((1024*1024*1024)) ]; then
+        val=$(awk "BEGIN {printf \"%.3f\", $bytes/1024/1024/1024}")
+        unit="GB"
+    elif [ "$bytes" -ge $((1024*1024)) ]; then
+        val=$(awk "BEGIN {printf \"%.3f\", $bytes/1024/1024}")
+        unit="MB"
+    else
+        val=$(awk "BEGIN {printf \"%.3f\", $bytes/1024}")
+        unit="KB"
+    fi
+
+    str=$(printf "%s: %.3f %s" "$prefix" "$val" "$unit")
+
+    printf -v "$str_var" '%s' "$str"
+}
+
+MAX_SKIP_COUNT=$((CYCLE_COUNT * ${#TUN_TO_HOST[@]}))
+SKIP_ROTATION=0
+
+declare -A HOST_ROTATION
+
+LOG DEBUG "Rotation scheduler initialized with rotate=${ROTATE}s, min_channel_interval=${MIN_CHANNEL_INTERVAL}s, min_stable_time=${MIN_STABLE_TIME}s, cycle_count=${CYCLE_COUNT}, max_skip_count=${MAX_SKIP_COUNT}"
+
+while true; do
+    if [ -f "${STOP_FILE}" ]; then
+        LOG INFO "Skipping by external signal..."
+        exit 0
+    fi
+
+    NOW=$(date +%s)
+
+    HOST_ROTATION=()
+
+    for TUN in "${!TUN_TO_HOST[@]}"; do
+        HOST=${TUN_TO_HOST[$TUN]}
+        ROTATION_FILE="${DATA_PATH}/tun_rotation_${TUN}"
+
+        if [ -f "${ROTATION_FILE}" ]; then
+            ROTATION_TTL=$((NOW - $(cat "${ROTATION_FILE}")))
+            if [ $ROTATION_TTL -lt $MIN_CHANNEL_INTERVAL ]; then
+                HOST_ROTATION["$HOST"]=1
+            else
+                if [ ! -f "${DATA_PATH}/tun_host_${HOST}_disabled" ]; then
+                    LOG DEBUG "Rotation triggered for tun${TUN} is stale (age: ${ROTATION_TTL}s), removing..."
+
+                    rm -f "${ROTATION_FILE}" 2>/dev/null || true
+                    ./tun.post.balance.routing "add" "${TUN}" "${#TUN_TO_HOST[@]}" "${CONFIG}" "drop" 2>/dev/null || true
+                fi
+            fi
+        fi
+    done
+
+    if [ ${#TUN_TO_HOST[@]} -lt $MIN_UNIQUE_HOSTS ]; then
+        LOG DEBUG "Only ${#TUN_TO_HOST[@]} tunnel(s) loaded. Skipping rotation logic."
+        SKIP_ROTATION=1
+    fi
+
+    if [ ${#UNIQUE_HOSTS[@]} -lt $MIN_UNIQUE_HOSTS ]; then
+        LOG DEBUG "All tunnels point to the same host (${!UNIQUE_HOSTS[*]}). Skipping rotation logic."
+        SKIP_ROTATION=1
+    fi
+
+    FREE_HOSTS=0
+    for H in "${!UNIQUE_HOSTS[@]}"; do
+        [ -f "${DATA_PATH}/tun_host_${H}_busy" ] || FREE_HOSTS=$((FREE_HOSTS + 1))
+    done
+    if [ $FREE_HOSTS -lt $MIN_UNIQUE_HOSTS ]; then
+        LOG DEBUG "Only ${FREE_HOSTS} host(s) not used by another server. Skipping rotation logic."
+        SKIP_ROTATION=1
+    fi
+
+    should_skip_rotation
+    RESULT=$?
+
+    if [ "$RESULT" -eq 1 ]; then
+        SKIP_ROTATION=1
+    elif [ "$RESULT" -eq 0 ]; then
+        SKIP_ROTATION=0
+    fi
+
+    if [ $SKIP_ROTATION -eq 1 ]; then
+        wait 10
+        continue
+    fi
+
+    LAST_ONLINE=$(get_last_online)
+    if [ $((NOW - LAST_ONLINE)) -lt $MIN_STABLE_TIME ]; then
+        wait 1
+        continue
+    fi
+
+    BEST_TUN=0
+    BEST_SCORE=0
+    FORCED=0
+    MATURE_TUNS=()
+
+    AVG_SPREAD=$(get_avg_connect_spread)
+    
+    for TUN in "${!TUN_TO_HOST[@]}"; do
+        HOST=${TUN_TO_HOST[$TUN]}
+
+        if [[ -v HOST_ROTATION["$HOST"] ]]; then
+            LOG DEBUG "Host ${HOST} is rotation, skip tunnel ${TUN}..."
+            continue
+        fi
+
+        # Check the current status
+        if ! ip link show "tun${TUN}" > /dev/null 2>&1; then
+            continue
+        fi
+
+        # Get the time of the last switch to ONLINE
+        LAST_ONLINE=$(get_last_online_by_tun "$TUN")
+        if [ $((NOW - LAST_ONLINE)) -lt $MIN_STABLE_TIME ]; then
+            continue   # the channel came up too recently
+        fi
+
+        if [ ! -f "${DATA_PATH}/tun_host_${HOST}_configured" ] && [ ! -f "${DATA_PATH}/tun_host_${HOST}_loaded" ]; then
+            continue
+        fi
+
+        # Check the host lock
+        if [ $MIN_UNIQUE_HOSTS -gt 1 ] && [ -d "${DATA_PATH}/tun_host_${HOST}.lock" ]; then
+            continue
+        fi
+
+        LAST_ROTATE=$(get_last_rotate "$TUN")
+        TIME_SINCE_LAST=$((NOW - LAST_ROTATE))
+
+        SCORE=$TIME_SINCE_LAST
+
+        # Lower the priority of recently rotated channels
+        if [ $TIME_SINCE_LAST -lt $MIN_CHANNEL_INTERVAL ]; then
+            SCORE=$((SCORE / 5))
+        fi
+
+        AVG_CONNECT=$(get_avg_connect_duration "$TUN" 5)
+
+        # Linear staleness penalty, subtracted from the score
+        if [ "$AVG_CONNECT" -gt 0 ]; then
+            SCORE=$((SCORE * 100 / (100 + AVG_CONNECT * (AVG_SPREAD + 1))))
+        fi
+
+        SKIP_COUNTER=$(get_skip_count "$TUN")
+
+        if [ "$SKIP_COUNTER" -ge "$MAX_SKIP_COUNT" ]; then
+            SCORE=$((SCORE + 1000000))
+            FORCED=1
+        elif [ "$TIME_SINCE_LAST" -ge "$MIN_CHANNEL_INTERVAL" ]; then
+            MATURE_TUNS+=("$TUN")
+        fi
+
+        LOG DEBUG "Evaluating tun${TUN} (host: ${HOST}, online: $((NOW - LAST_ONLINE))s ago, last rotate: $((NOW - LAST_ROTATE))s ago, skip count: ${SKIP_COUNTER}, avg connect: ${AVG_CONNECT}s, score: ${SCORE})"
+
+        if [ $SCORE -gt $BEST_SCORE ]; then
+            BEST_SCORE=$SCORE
+            BEST_TUN=$TUN
+        fi
+    done
+
+    if [ "$BEST_TUN" -eq 0 ]; then
+        wait 8
+        continue
+    fi
+
+    LOG INFO "Avg spread: ${AVG_SPREAD}s"
+
+    SELECTED_BY="score: ${BEST_SCORE}"
+    if [ "$FORCED" -eq 0 ] && [ ${#MATURE_TUNS[@]} -gt 0 ]; then
+        BEST_TUN=${MATURE_TUNS[RANDOM % ${#MATURE_TUNS[@]}]}
+        SELECTED_BY="random among ${#MATURE_TUNS[@]} matured: ${MATURE_TUNS[*]}"
+    fi
+
+    HOST=${TUN_TO_HOST[$BEST_TUN]}
+
+    ROTATE_JITTER=0
+    [ "$ROTATE" -gt 0 ] && ROTATE_JITTER=$((((RANDOM << 15) | RANDOM) % ROTATE))
+    EFFECTIVE_ROTATE=$((ROTATE + ROTATE_JITTER))
+
+    LOG INFO "Scheduler selected tun${BEST_TUN} on ${HOST} for rotation (${SELECTED_BY}, waiting ${EFFECTIVE_ROTATE}s)"
+
+    wait $EFFECTIVE_ROTATE "$BEST_TUN" # called without a subshell so that check_last_states_change can update LAST_STATES
+    if [ $? -eq 1 ]; then
+        LOG INFO "State change detected during pre-rotation wait. Skipping rotation of tun${BEST_TUN}"
+        continue
+    fi
+
+    ROTATION_FILE="${DATA_PATH}/tun_rotation_${BEST_TUN}"
+
+    echo "${NOW}" > "${ROTATION_FILE}"
+    ./tun.post.balance.routing "remove" "${BEST_TUN}" "${#TUN_TO_HOST[@]}" "${CONFIG}" "drop" 2>/dev/null || true
+
+    if [ ! -f "${DATA_PATH}/tun_host_${HOST}_disabled" ]; then
+        wait_traffic_drain "$BEST_TUN"
+        drain_rc=$?
+
+        if [ $drain_rc -eq 1 ]; then
+            LOG INFO "State change or interface went down during traffic drain. Skipping rotation of tun${BEST_TUN}"
+
+            rm -f "${ROTATION_FILE}" 2>/dev/null || true
+            ./tun.post.balance.routing "add" "${BEST_TUN}" "${#TUN_TO_HOST[@]}" "${CONFIG}" "drop" 2>/dev/null || true
+            continue
+        fi
+
+        if [ $drain_rc -eq 2 ]; then
+            if [ "$ON_DRAIN_TIMEOUT" = "skip" ]; then
+                LOG INFO "Traffic drain timeout and ON_DRAIN_TIMEOUT=skip → skipping rotation of tun${BEST_TUN} this cycle"
+
+                rm -f "${ROTATION_FILE}" 2>/dev/null || true
+                ./tun.post.balance.routing "add" "${BEST_TUN}" "${#TUN_TO_HOST[@]}" "${CONFIG}" "drop" 2>/dev/null || true
+                continue
+            else
+                LOG WARN "Traffic drain timeout → forcing rotation of tun${BEST_TUN} (ON_DRAIN_TIMEOUT=force)"
+            fi
+        fi
+    fi
+
+    NOW=$(date +%s)
+    echo "${NOW}" > "${DATA_PATH}/tun_start_connect_time_${BEST_TUN}"
+
+    CURRENT=$(awk "/tun${BEST_TUN}:/ {print \$2, \$10}" /proc/net/dev 2>/dev/null || echo "0 0")
+    read -r RX TX <<< "$CURRENT"
+
+    format_bytes "$RX" TRX_STR "RX"
+    format_bytes "$TX" TTX_STR "TX"
+
+    LOG INFO "Current traffic on tun${BEST_TUN} before rotation: ${TRX_STR}, ${TTX_STR}"
+
+    ./tun.post.balance.remove "${BEST_TUN}" "10.${BEST_TUN}.${BEST_TUN}.2" "${#TUN_TO_HOST[@]}" "${CONFIG}" 2>/dev/null || true
+    
+    echo "0" > "${ROTATION_FILE}"
+
+    tunnel_kill_by_tun "${BEST_TUN}"
+
+    find "${DATA_PATH}" -name "tun_host_*.lock" -type d -delete 2>/dev/null || true
+    
+    if [ $MIN_UNIQUE_HOSTS -gt 1 ]; then
+        mkdir "${DATA_PATH}/tun_host_${HOST}.lock" 2>/dev/null || true
+    fi
+    
+    date +%s > "${DATA_PATH}/tun_last_rotate_${BEST_TUN}"
+
+    for TUN in "${!TUN_TO_HOST[@]}"; do
+        if [ "$TUN" != "$BEST_TUN" ]; then
+            SKIP_COUNTER=$(increment_skip_count "$TUN")
+        else
+            reset_skip_count "$TUN"
+        fi
+    done
+
+    wait $MIN_STABLE_TIME
+
+    LOG INFO "Rotation of tun${BEST_TUN} completed"
+done

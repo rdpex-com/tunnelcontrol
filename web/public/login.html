@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Tunnel Control Panel — Login</title>
+
+    <script src="js/app/platform-early.js"></script>
+    <script src="js/tailwind.min.js"></script>
+    <script>
+        tailwind.config = { darkMode: 'class' };
+
+        (function () {
+            let theme = null;
+            try { theme = localStorage.getItem('theme'); } catch (e) { theme = null; }
+            if (!theme) theme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+            const html = document.documentElement;
+            html.classList.remove('dark', 'light');
+            html.classList.add(theme);
+            html.style.setProperty('color-scheme', theme, 'important');
+        })();
+    </script>
+
+    <link rel="stylesheet" href="css/fontawesome.min.css">
+    <link rel="icon" type="image/png" href="favicon.png">
+    <link rel="manifest" href="manifest.json">
+    <meta name="color-scheme" content="light dark">
+</head>
+<body class="bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100 min-h-screen flex flex-col items-center justify-center p-6">
+    <form id="login-form" class="w-full max-w-sm space-y-5">
+        <h1 class="text-3xl font-bold text-gray-900 dark:text-white">Tunnel Control™ Panel</h1>
+
+        <div id="login-message" class="hidden text-sm rounded-xl px-4 py-3"></div>
+
+        <div id="cert-warning" class="hidden text-sm rounded-xl px-4 py-3 space-y-3 bg-yellow-100 text-yellow-900 dark:bg-yellow-900/40 dark:text-yellow-100">
+            <div class="font-medium">This device does not trust the panel certificate, so updates, push notifications and offline mode may not work.</div>
+            <div id="cert-hint"></div>
+            <a href="/cert.pem" download="tun-panel.crt"
+               class="block text-center bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2.5 rounded-2xl font-semibold">
+                Download Certificate
+            </a>
+        </div>
+
+        <div id="login-fields" class="space-y-4">
+            <input id="login-user" type="text" autocomplete="username" placeholder="Login" required
+                class="w-full bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-xl px-4 py-3
+                       text-gray-900 dark:text-gray-100 focus:outline-none focus:border-blue-500">
+            <input id="login-password" type="password" autocomplete="current-password" placeholder="Password" required
+                class="w-full bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-xl px-4 py-3
+                       text-gray-900 dark:text-gray-100 focus:outline-none focus:border-blue-500">
+            <button id="login-submit" type="submit"
+                class="w-full bg-blue-600 hover:bg-blue-700 active:bg-blue-800 disabled:opacity-50 px-6 py-3 rounded-2xl
+                       font-medium flex items-center justify-center gap-2 text-white transition-colors">
+                <i class="fas fa-sign-in-alt"></i>
+                Log In
+            </button>
+        </div>
+    </form>
+
+    <script type="module">
+        import { initDebugMode, logDebug } from './js/app/debug.js';
+        import { checkCertificateTrust, describeCertificateCheck, certificateInstallHtml } from './js/app/cert-check.js';
+
+        initDebugMode();
+
+        checkCertificateTrust().then((result) => {
+            logDebug(describeCertificateCheck(result));
+            if (result.trusted === false) {
+                showCertificateWarning();
+            }
+        });
+
+        const form = document.getElementById('login-form');
+        const message = document.getElementById('login-message');
+        const fields = document.getElementById('login-fields');
+        const submit = document.getElementById('login-submit');
+
+        function showMessage(text, isError) {
+            message.textContent = text;
+            message.className = 'text-sm rounded-xl px-4 py-3 ' + (isError
+                ? 'bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-200'
+                : 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300');
+        }
+
+        async function checkStatus() {
+            try {
+                const res = await fetch('/api/auth/status', { cache: 'no-store' });
+                const data = await res.json();
+                if (!data.enabled || data.authenticated) {
+                    location.replace('/');
+                    return;
+                }
+                if (!data.configured) {
+                    fields.classList.add('hidden');
+                    showMessage('Login is enabled, but no password is set. Run "tun --web-password" on the server.', false);
+                    return;
+                }
+                document.getElementById('login-user').focus();
+            } catch (e) {
+                showMessage('Server is not reachable', true);
+            }
+        }
+
+        form.addEventListener('submit', async (event) => {
+            event.preventDefault();
+            submit.disabled = true;
+            try {
+                const res = await fetch('/api/auth/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        login: document.getElementById('login-user').value,
+                        password: document.getElementById('login-password').value
+                    })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    location.replace('/');
+                    return;
+                }
+                if (data.error === 'not_configured') {
+                    await checkStatus();
+                } else {
+                    showMessage(data.error || 'Login failed', true);
+                }
+            } catch (e) {
+                showMessage('Server is not reachable', true);
+            }
+            submit.disabled = false;
+        });
+
+        function showCertificateWarning() {
+            document.getElementById('cert-hint').innerHTML = certificateInstallHtml();
+            document.getElementById('cert-warning').classList.remove('hidden');
+        }
+
+        logDebug(`[App] Login page environment: secureContext=${window.isSecureContext}, serviceWorker=${'serviceWorker' in navigator}, ` +
+            `pwa=${!!window.Platform.isPWA()}, ios=${window.Platform.isIOS()}, android=${window.Platform.isAndroid()}, ua=${navigator.userAgent}`);
+
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js').then(() => {
+                logDebug('[App] Service Worker registered (login page)');
+            }).catch((err) => {
+                logDebug('[App] SW registration failed:', `${err.name}: ${err.message}`);
+                if (/SSL|certificate/i.test(err.message || '')) {
+                    showCertificateWarning();
+                }
+            });
+        } else {
+            logDebug('[App] Service Worker API is not available on this page');
+        }
+
+        checkStatus();
+    </script>
+</body>
+</html>

@@ -1,0 +1,550 @@
+#!/bin/bash
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+MON_LOG="/var/log/tun.mon.total.log"
+VERBOSE_LOG="/var/log/tun.mon.verbose.log"
+DEBUG_LOG="/var/log/tun.mon.debug.log"
+[ "${LOG_LEVEL:-1}" -ge 2 ] 2>/dev/null || { MON_LOG=/dev/null; VERBOSE_LOG=/dev/null; }
+[ "${LOG_LEVEL:-1}" -ge 3 ] 2>/dev/null || DEBUG_LOG=/dev/null
+
+LOG_INFO() {
+    local msg="$1"
+    local target="${2:-$MON_LOG}"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" | tee -a "$target"
+}
+
+export -f LOG_INFO
+export MON_LOG VERBOSE_LOG
+export DEBUG_LOG
+
+LOG_INFO "Starting dynamic tun traffic monitoring, Log level: ${LOG_LEVEL:-1}"
+
+trap '' TSTP
+
+if [[ ! -t 0 ]]; then
+    trap '' TTIN TTOU
+fi
+
+declare -A MONITORS
+TOTAL_MONITOR_PID=0
+
+pkill -f "tun-monitor-" 2>/dev/null || true
+
+read_bytes_file() {
+    local file="$1"
+    local __rx_var="$2"
+    local __tx_var="$3"
+    local rx tx
+
+    [[ -r "$file" ]] || return 1
+
+    if ! read -r rx tx < <(awk '{print $1, $2}' "$file" 2>/dev/null) || \
+       [ -z "$rx" ] || [ -z "$tx" ] || \
+       ! [[ "$rx" =~ ^[0-9]+$ ]] || ! [[ "$tx" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+
+    printf -v "$__rx_var" '%s' "$rx"
+    printf -v "$__tx_var" '%s' "$tx"
+    return 0
+}
+
+export -f read_bytes_file
+
+format_traffic() {
+    local value=$1
+    local str_var=$2            # name of the string variable (TRX_STR / TTX_STR)
+    local prefix=$3             # "RX" or "TX"
+    local num_fmt=${4:-"%.3f"}  # number format
+    local unit_suffix=${5:-""}  # suffix ("" or "/s")
+    local val unit str
+    
+    export LC_NUMERIC=C
+
+    if [ "$value" -ge $((1024*1024*1024)) ]; then
+        val=$(awk "BEGIN {printf \"$num_fmt\", $value/1024/1024/1024}")
+        unit="GB${unit_suffix}"
+    elif [ "$value" -ge $((1024*1024)) ]; then
+        val=$(awk "BEGIN {printf \"$num_fmt\", $value/1024/1024}")
+        unit="MB${unit_suffix}"
+    else
+        val=$(awk "BEGIN {printf \"$num_fmt\", $value/1024}")
+        unit="KB${unit_suffix}"
+    fi
+    str=$(printf "%s:%s %s" "$prefix" "$val" "$unit")
+    
+    printf -v "$str_var" '%s' "$str"
+}
+
+format_traffic_() {
+    local value=$1
+    local str_var=$2
+    local prefix=$3
+    local num_fmt=${4:-"%.3f"}
+    local unit_suffix=${5:-""}
+    local val unit
+
+    export LC_NUMERIC=C
+
+    if [ "$value" -ge $((1024*1024*1024)) ]; then
+        local whole=$(( value / 1073741824 ))
+        local rem=$(( value % 1073741824 ))
+        local dec=$(( rem * 1000 / 1073741824 ))
+        printf -v val "%d.%03d" "$whole" "$dec"
+        unit="GB${unit_suffix}"
+    elif [ "$value" -ge $((1024*1024)) ]; then
+        local whole=$(( value / 1048576 ))
+        local rem=$(( value % 1048576 ))
+        local dec=$(( rem * 1000 / 1048576 ))
+        printf -v val "%d.%03d" "$whole" "$dec"
+        unit="MB${unit_suffix}"
+    else
+        local whole=$(( value / 1024 ))
+        local rem=$(( value % 1024 ))
+        local dec=$(( rem * 1000 / 1024 ))
+        printf -v val "%d.%03d" "$whole" "$dec"
+        unit="KB${unit_suffix}"
+    fi
+
+    local formatted
+    printf -v formatted "$num_fmt" "$val"
+    local str
+    printf -v str "%s:%s %s" "$prefix" "$formatted" "$unit"
+    printf -v "$str_var" '%s' "$str"
+}
+
+export -f format_traffic
+
+tun_monitor() {
+    local TUN=$1
+
+    export LC_NUMERIC=C
+
+    trap '' TSTP
+    if [[ ! -t 0 ]]; then
+        trap '' TTIN TTOU
+    fi
+
+    TUN_STOP_FILE="${DATA_PATH}/tun_stop_${TUN}"
+
+    wait_interval() {
+        local seconds=$1
+        local i
+
+        for ((i=1; i<=seconds; i++)); do
+            if [ -f "${DATA_PATH}/tun_stop" ]; then
+                LOG_INFO "${TUN} Stopping by external signal..." "$VERBOSE_LOG"
+                exit 0
+            fi
+            if [ -f "${TUN_STOP_FILE}" ]; then
+                local status=$(cat "$TUN_STOP_FILE" 2>/dev/null)
+                if [ "$status" = "0" ]; then
+                    LOG_INFO "${TUN} Stopping by external signal 0..." "$VERBOSE_LOG"
+                    exit 0
+                fi
+            fi
+            if ! ip link show "${TUN}" > /dev/null 2>&1; then
+                LOG_INFO "${TUN} Interface disappeared. Graceful shutdown." "$VERBOSE_LOG"
+                exit 0
+            fi
+            sleep 1
+        done
+
+        return 0
+    }
+
+    # === RESTORE PERSIST ===
+    if [ -f "${DATA_PATH}/tun_persist_${TUN}" ]; then
+        read -r PERSIST_RX PERSIST_TX < "${DATA_PATH}/tun_persist_${TUN}"
+        PERSIST_RX=${PERSIST_RX:-0}
+        PERSIST_TX=${PERSIST_TX:-0}
+        LOG_INFO "${TUN} RESTORE PERSIST_RX: ${PERSIST_RX}, PERSIST_TX: ${PERSIST_TX}" "$VERBOSE_LOG"
+    else
+        PERSIST_RX=0
+        PERSIST_TX=0
+        LOG_INFO "${TUN} NEW PERSIST - starting from 0" "$VERBOSE_LOG"
+    fi
+
+    # === RESTORE LAST ===
+    if [ -f "${DATA_PATH}/tun_last_${TUN}" ]; then
+        read -r LAST_RX LAST_TX < "${DATA_PATH}/tun_last_${TUN}"
+        LAST_RX=${LAST_RX:-0}
+        LAST_TX=${LAST_TX:-0}
+        LOG_INFO "${TUN} RESTORE LAST_RX: ${LAST_RX}, LAST_TX: ${LAST_TX}" "$VERBOSE_LOG"
+    else
+        LAST_RX=0
+        LAST_TX=0
+        LOG_INFO "${TUN} NEW LAST - starting from 0" "$VERBOSE_LOG"
+    fi
+
+    local LAST_MEASURE_TIME=""
+
+    while true; do
+        if [ -f "${DATA_PATH}/tun_stop" ]; then
+            LOG_INFO "${TUN} Skipping by external signal..." "$VERBOSE_LOG"
+            exit 0
+        fi
+
+        CURRENT=$(awk "/${TUN}:/ {print \$2, \$10}" /proc/net/dev 2>/dev/null || echo "0 0")
+        read RX TX <<< "$CURRENT"
+        RX=${RX:-0}
+        TX=${TX:-0}
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${TUN} PROC: RX=${RX} TX=${TX} LAST=${LAST_RX}/${LAST_TX} PERSIST=${PERSIST_RX}/${PERSIST_TX}" >> "$DEBUG_LOG"
+
+        if [ "$RX" -lt 0 ] || [ "$TX" -lt 0 ]; then
+            wait_interval 10
+            continue
+        fi
+
+        PERSIST_SAVE=0
+        
+        if [ "$RX" -lt "$LAST_RX" ]; then
+            LOG_INFO "${TUN} RESET_DETECTED_RX: ${RX} < ${LAST_RX}" >> "$VERBOSE_LOG"
+            PERSIST_RX=$((PERSIST_RX + LAST_RX))   # commit previous segment
+            PERSIST_SAVE=1
+        fi
+
+        if [ "$TX" -lt "$LAST_TX" ]; then
+            LOG_INFO "${TUN} RESET_DETECTED_TX: ${TX} < ${LAST_TX}" >> "$VERBOSE_LOG"
+            PERSIST_TX=$((PERSIST_TX + LAST_TX))
+            PERSIST_SAVE=1
+        fi
+
+        BYTES_RX=$((PERSIST_RX + RX))
+        BYTES_TX=$((PERSIST_TX + TX))
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ${TUN} BYTES: RX=${BYTES_RX} TX=${BYTES_TX}" >> "$DEBUG_LOG"
+
+        if [ -n "$LAST_MEASURE_TIME" ]; then
+            local elapsed=$(( $(date +%s) - LAST_MEASURE_TIME ))
+            [ "$elapsed" -le 0 ] && elapsed=1
+
+            # Speed
+            SPEED_RX=$((RX - LAST_RX))
+            SPEED_TX=$((TX - LAST_TX))
+            
+            [ "$SPEED_RX" -lt 0 ] && SPEED_RX=0
+            [ "$SPEED_TX" -lt 0 ] && SPEED_TX=0
+            
+            #SPEED_RX=$(awk "BEGIN {printf \"%.0f\", $SPEED_RX / elapsed }")
+            #SPEED_TX=$(awk "BEGIN {printf \"%.0f\", $SPEED_TX / elapsed }")
+            SPEED_RX=$(( SPEED_RX / elapsed ))
+            SPEED_TX=$(( SPEED_TX / elapsed ))
+        else
+            SPEED_RX=0
+            SPEED_TX=0
+        fi
+
+        format_traffic "$SPEED_RX" "RX_STR" "RX" "%8.3f" "/s"
+        format_traffic "$SPEED_TX" "TX_STR" "TX" "%8.3f" "/s"
+
+        format_traffic "$BYTES_RX" "TRX_STR" "RX" "%8.3f" ""
+        format_traffic "$BYTES_TX" "TTX_STR" "TX" "%8.3f" ""
+
+        echo "$RX_STR $TX_STR" | tr -s ' ' > "${DATA_PATH}/tun_speed_${TUN}"
+
+        RESULT=$(printf "%-7s | %s | %s | %s | %s\n" "$TUN" "$RX_STR" "$TX_STR" "$TRX_STR" "$TTX_STR")
+        
+        LOG_INFO "$RESULT" "$VERBOSE_LOG"
+
+        # Write
+        echo "$BYTES_RX $BYTES_TX" > "${DATA_PATH}/tun_bytes_${TUN}.tmp"
+        mv -f "${DATA_PATH}/tun_bytes_${TUN}.tmp" "${DATA_PATH}/tun_bytes_${TUN}"
+
+        if [ "$PERSIST_SAVE" = 1 ]; then
+            echo "$PERSIST_RX $PERSIST_TX" > "${DATA_PATH}/tun_persist_${TUN}.tmp"
+            mv -f "${DATA_PATH}/tun_persist_${TUN}.tmp" "${DATA_PATH}/tun_persist_${TUN}"
+        fi
+
+        LAST_RX=$RX
+        LAST_TX=$TX
+        echo "$LAST_RX $LAST_TX" > "${DATA_PATH}/tun_last_${TUN}"
+
+        LAST_MEASURE_TIME=$(date +%s)
+
+        wait_interval 10
+    done
+}
+
+export -f tun_monitor
+
+total_monitor() {
+    export LC_NUMERIC=C
+
+    trap '' TSTP
+    if [[ ! -t 0 ]]; then
+        trap '' TTIN TTOU
+    fi
+
+    wait_interval() {
+        local seconds=$1
+        local i
+
+        for ((i=1; i<=seconds; i++)); do
+            if [ -f "${DATA_PATH}/tun_stop" ]; then
+                LOG_INFO "TOTAL Stopping by external signal..." "$VERBOSE_LOG"
+                exit 0
+            fi
+            sleep 1
+        done
+
+        return 0
+    }
+
+    # === RESTORE PERSIST AND LAST ===
+    if [ -f "${DATA_PATH}/tun_persist_total" ]; then
+        read -r PERSIST_TOTAL_RX PERSIST_TOTAL_TX < "${DATA_PATH}/tun_persist_total"
+        PERSIST_TOTAL_RX=${PERSIST_TOTAL_RX:-0}
+        PERSIST_TOTAL_TX=${PERSIST_TOTAL_TX:-0}
+        LOG_INFO "TOTAL RESTORE PERSIST_RX: ${PERSIST_TOTAL_RX}, PERSIST_TX: ${PERSIST_TOTAL_TX}" "$VERBOSE_LOG"
+    else
+        PERSIST_TOTAL_RX=0
+        PERSIST_TOTAL_TX=0
+        LOG_INFO "TOTAL NEW PERSIST - starting from 0" "$VERBOSE_LOG"
+    fi
+
+    if [ -f "${DATA_PATH}/tun_bytes_total_adjust" ]; then
+        if [ -f "${DATA_PATH}/tun_bytes_total" ]; then
+            read -r OLD_TOTAL_RX OLD_TOTAL_TX < "${DATA_PATH}/tun_bytes_total"
+            OLD_TOTAL_RX=${OLD_TOTAL_RX:-0}
+            OLD_TOTAL_TX=${OLD_TOTAL_TX:-0}
+
+            PERSIST_TOTAL_RX=$((PERSIST_TOTAL_RX + OLD_TOTAL_RX))
+            PERSIST_TOTAL_TX=$((PERSIST_TOTAL_TX + OLD_TOTAL_TX))
+
+            # Save the updated persist right away
+            echo "$PERSIST_TOTAL_RX $PERSIST_TOTAL_TX" > "${DATA_PATH}/tun_persist_total.tmp"
+            mv -f "${DATA_PATH}/tun_persist_total.tmp" "${DATA_PATH}/tun_persist_total"
+
+            LOG_INFO "CONFIG CHANGE: Added to PERSIST → RX=${OLD_TOTAL_RX}, TX=${OLD_TOTAL_TX}. New PERSIST: ${PERSIST_TOTAL_RX}/${PERSIST_TOTAL_TX}" "$VERBOSE_LOG"
+        fi
+        rm -f "${DATA_PATH}/tun_bytes_total_adjust" 2>/dev/null || true
+    fi
+
+    if [ -f "${DATA_PATH}/tun_last_total" ]; then
+        read -r LAST_TOTAL_RX LAST_TOTAL_TX < "${DATA_PATH}/tun_last_total"
+        LAST_TOTAL_RX=${LAST_TOTAL_RX:-0}
+        LAST_TOTAL_TX=${LAST_TOTAL_TX:-0}
+        LOG_INFO "TOTAL RESTORE LAST_RX: ${LAST_TOTAL_RX}, LAST_TX: ${LAST_TOTAL_TX}" "$VERBOSE_LOG"
+    else
+        LAST_TOTAL_RX=0
+        LAST_TOTAL_TX=0
+        LOG_INFO "TOTAL NEW LAST - starting from 0" "$VERBOSE_LOG"
+    fi
+
+    local LAST_MEASURE_TIME=""
+
+    while true; do
+        if [ -f "${DATA_PATH}/tun_stop" ]; then
+            LOG_INFO "TOTAL Skipping by external signal..." "$VERBOSE_LOG"
+            exit 0
+        fi
+
+        # Sum the tunnel bytes
+        read_all_tunnels() {
+            local max_retries=5
+            local retry=0
+            local read_error=0
+
+            while [ $retry -lt $max_retries ]; do
+                TOTAL_BYTES_RX=0
+                TOTAL_BYTES_TX=0
+                read_error=0
+
+                for bytes_file in "${DATA_PATH}"/tun_bytes_tun*; do
+                    [ -f "$bytes_file" ] || continue
+
+                    local BYTES_RX BYTES_TX
+
+                    if ! read_bytes_file "$bytes_file" BYTES_RX BYTES_TX; then
+                        read_error=1
+                        echo "[$(date '+%Y-%m-%d %H:%M:%S')] TOTAL READ_FAIL: $bytes_file (invalid or partial content)" >> "$DEBUG_LOG"
+                        break
+                    fi
+
+                    echo "[$(date '+%Y-%m-%d %H:%M:%S')] TOTAL READ: $bytes_file -> RX=${BYTES_RX} TX=${BYTES_TX}" >> "$DEBUG_LOG"
+
+                    TOTAL_BYTES_RX=$((TOTAL_BYTES_RX + BYTES_RX))
+                    TOTAL_BYTES_TX=$((TOTAL_BYTES_TX + BYTES_TX))
+                done
+
+                if [ $read_error -eq 0 ]; then
+                    return 0
+                fi
+
+                retry=$((retry + 1))
+                [ $retry -lt $max_retries ] && usleep 100000
+            done
+
+            return 1
+        }
+
+        if ! read_all_tunnels; then
+            LOG_INFO "TOTAL: Failed to read all tunnel files after retries. Skipping this total update cycle." "$VERBOSE_LOG"
+            wait_interval 10
+            continue
+        fi
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] TOTAL_SUM: BYTES_RX=${TOTAL_BYTES_RX} LAST=${LAST_TOTAL_RX} PERSIST=${PERSIST_TOTAL_RX}" >> "$DEBUG_LOG"
+
+        # === RESET LOGIC ===
+        PERSIST_SAVE=0
+
+        if [ "$TOTAL_BYTES_RX" -lt "$LAST_TOTAL_RX" ]; then
+            LOG_INFO "TOTAL RESET_DETECTED_RX: ${TOTAL_BYTES_RX} < ${LAST_TOTAL_RX}" >> "$VERBOSE_LOG"
+            PERSIST_TOTAL_RX=$((PERSIST_TOTAL_RX + LAST_TOTAL_RX))
+            PERSIST_SAVE=1
+        fi
+
+        if [ "$TOTAL_BYTES_TX" -lt "$LAST_TOTAL_TX" ]; then
+            LOG_INFO "TOTAL RESET_DETECTED_TX: ${TOTAL_BYTES_TX} < ${LAST_TOTAL_TX}" >> "$VERBOSE_LOG"
+            PERSIST_TOTAL_TX=$((PERSIST_TOTAL_TX + LAST_TOTAL_TX))
+            PERSIST_SAVE=1
+        fi
+
+        BYTES_TOTAL_RX=$((PERSIST_TOTAL_RX + TOTAL_BYTES_RX))
+        BYTES_TOTAL_TX=$((PERSIST_TOTAL_TX + TOTAL_BYTES_TX))
+
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] TOTAL BYTES FINAL: RX=${BYTES_TOTAL_RX} TX=${BYTES_TOTAL_TX}" >> "$DEBUG_LOG"
+
+        SPEED_SAVE=0
+
+        if [ -n "$LAST_MEASURE_TIME" ]; then
+            local elapsed=$(( $(date +%s) - LAST_MEASURE_TIME ))
+            [ "$elapsed" -le 0 ] && elapsed=1
+
+            SPEED_RX=$(( TOTAL_BYTES_RX - LAST_TOTAL_RX ))
+            SPEED_TX=$(( TOTAL_BYTES_TX - LAST_TOTAL_TX ))
+
+            [ "$SPEED_RX" -lt 0 ] && SPEED_RX=0
+            [ "$SPEED_TX" -lt 0 ] && SPEED_TX=0
+
+            SPEED_RX=$(( SPEED_RX / elapsed ))
+            SPEED_TX=$(( SPEED_TX / elapsed ))
+
+            SPEED_SAVE=1
+        else
+            SPEED_RX=0
+            SPEED_TX=0
+        fi
+
+        format_traffic "$SPEED_RX" "RX_STR" "RX" "%8.3f" "/s"
+        format_traffic "$SPEED_TX" "TX_STR" "TX" "%8.3f" "/s"
+
+        echo "$RX_STR $TX_STR" | tr -s ' ' > "${DATA_PATH}/tun_speed_total"
+
+        format_traffic "$BYTES_TOTAL_RX" "TRX_STR" "RX" "%8.3f" ""
+        format_traffic "$BYTES_TOTAL_TX" "TTX_STR" "TX" "%8.3f" ""
+
+        RESULT=$(printf "[TOTAL] | %s | %s | %s | %s\n" "$RX_STR" "$TX_STR" "$TRX_STR" "$TTX_STR")
+
+        LOG_INFO "$RESULT" "$MON_LOG"
+        LOG_INFO "$RESULT" "$VERBOSE_LOG"
+
+        # Write
+        echo "$BYTES_TOTAL_RX $BYTES_TOTAL_TX" > "${DATA_PATH}/tun_bytes_total.tmp"
+        mv -f "${DATA_PATH}/tun_bytes_total.tmp" "${DATA_PATH}/tun_bytes_total"
+
+        if [ "$PERSIST_SAVE" = 1 ]; then
+            echo "$PERSIST_TOTAL_RX $PERSIST_TOTAL_TX" > "${DATA_PATH}/tun_persist_total.tmp"
+            mv -f "${DATA_PATH}/tun_persist_total.tmp" "${DATA_PATH}/tun_persist_total"
+        fi
+
+        LAST_TOTAL_RX=$TOTAL_BYTES_RX
+        LAST_TOTAL_TX=$TOTAL_BYTES_TX
+        echo "$LAST_TOTAL_RX $LAST_TOTAL_TX" > "${DATA_PATH}/tun_last_total"
+
+        if [ "$SPEED_SAVE" = 1 ]; then
+            TIMESTAMP=$(date +%s)
+            echo "{\"ts\":$TIMESTAMP,\"rx\":$SPEED_RX,\"tx\":$SPEED_TX}" >> "${DATA_PATH}/total_speed_history.log"
+            tail -n 720 "${DATA_PATH}/total_speed_history.log" > "${DATA_PATH}/total_speed_history.log.tmp" 2>/dev/null
+            mv -f "${DATA_PATH}/total_speed_history.log.tmp" "${DATA_PATH}/total_speed_history.log"
+
+            {
+                echo '{ "history": ['
+                head -c -1 "${DATA_PATH}/total_speed_history.log" | sed 's/$/,/' | sed '$ s/,$//'
+                echo '], "last_update": '"$TIMESTAMP"' }'
+            } > "${DATA_PATH}/total_history.json"
+        fi
+
+        LAST_MEASURE_TIME=$(date +%s)
+
+        wait_interval 10
+    done
+}
+
+export -f total_monitor
+
+start_monitor() {
+    local type=$1
+    local tun=$2
+
+    if [ "$type" = "tun" ]; then
+        (
+            exec -a "tun-monitor-${tun}" bash -c "tun_monitor \"${tun}\"" 2>> /var/log/tun.mon.errors.log
+        ) &
+        MONITORS["$tun"]=$!
+
+        LOG_INFO "Monitor for ${tun} started (PID: ${MONITORS[$tun]})"
+    elif [ "$type" = "total" ]; then
+        (
+            exec -a "tun-monitor-total" bash -c "total_monitor" 2>> /var/log/tun.mon.errors.log
+        ) &
+        TOTAL_MONITOR_PID=$!
+
+        LOG_INFO "Total traffic monitor started (PID: ${TOTAL_MONITOR_PID})"
+    fi
+}
+
+start_monitor "total"
+
+while true; do
+    if [ -f "${DATA_PATH}/tun_stop" ]; then
+        LOG_INFO "Skipping by external signal..."
+        while pgrep -f "tun-monitor-" > /dev/null; do
+            sleep 1
+        done
+        exit 0
+    fi
+
+    CURRENT_TUNS=$(ip -o link show | awk -F': ' '/tun[0-9]+/ {print $2}' | tr -d ' ')
+
+    # Start/restart the tunnel monitors
+    for TUN in $CURRENT_TUNS; do
+        if [ -f "${DATA_PATH}/tun_stop" ]; then
+            continue
+        fi
+
+        NEED_RESTART=0
+
+        if [ -z "${MONITORS[$TUN]}" ]; then
+            LOG_INFO "New interface ${TUN} detected. Starting monitor."
+            NEED_RESTART=1
+        elif ! kill -0 "${MONITORS[$TUN]}" 2>/dev/null; then
+            LOG_INFO "Monitor for ${TUN} died unexpectedly. Restarting..."
+            unset MONITORS[$TUN]
+            NEED_RESTART=1
+        fi
+
+        if [ $NEED_RESTART -eq 1 ]; then
+            start_monitor "tun" "$TUN"
+        fi
+    done
+
+    # Check the TOTAL monitor
+    if ! kill -0 "$TOTAL_MONITOR_PID" 2>/dev/null; then
+        if [ -f "${DATA_PATH}/tun_stop" ]; then
+            continue
+        fi
+
+        LOG_INFO "Total monitor died unexpectedly. Restarting..."
+        start_monitor "total"
+    fi
+
+    sleep 1
+done

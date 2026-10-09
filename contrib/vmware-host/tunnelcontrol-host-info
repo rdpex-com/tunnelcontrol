@@ -1,0 +1,49 @@
+#!/bin/bash
+# tunnelcontrol-host-info [--once]
+
+SENSORS=(
+    "CPU=Tctl"
+    "GPU=edge"
+    "SSD=Composite"
+)
+
+if [[ "$1" == "once" || "$1" == "-1" || "$1" == "--once" ]]; then
+    cpu_load=$(top -bn1 | grep "^%Cpu" | awk '{print $2}')
+    ram=$(free | awk '/^Mem:/ {
+        used = $3;
+        total = $2;
+        pct = int(used * 100 / total);
+
+        if (used >= 1048576) {
+            u = sprintf("%.1fG", used / 1048576);
+        } else if (used >= 1024) {
+            u = sprintf("%dM", used / 1024);
+        } else {
+            u = used "K";
+        }
+
+        if (total >= 1048576) {
+            t = sprintf("%.1fG", total / 1048576);
+        } else if (total >= 1024) {
+            t = sprintf("%dM", total / 1024);
+        } else {
+            t = sprintf("%dK", total);
+        }
+
+        printf "%s/%s (%d%%)", u, t, pct;
+    }')
+    disk=$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
+
+    readings=$(sensors 2>/dev/null)
+    temps=""
+    for sensor in "${SENSORS[@]}"; do
+        value=$(awk -v name="${sensor#*=}" 'index($0, name ":") == 1 {
+            for (i = 2; i <= NF; i++) if ($i ~ /°C$/) { print $i; exit }
+        }' <<< "$readings")
+        temps+=" | ${sensor%%=*}: ${value:--}"
+    done
+
+    printf "CPU: %s%% | RAM: %s | Disk: %s%s\n" "$cpu_load" "$ram" "$disk" "$temps"
+else
+    watch -n 1 --no-title --color "$0 --once"
+fi

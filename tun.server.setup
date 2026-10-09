@@ -1,0 +1,352 @@
+#!/bin/bash
+# tun.server <host> <port> <port_range> <in_face> <public_ip> <out_face> <cipher>
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+HOST=${1}
+PORT=${2}
+PORT_RANGE=${3}
+IN_FACE=${4}
+PUBLIC_IP=${5}
+OUT_FACE=${6}
+CIPHER=${7}
+PASSWORD=${SSHPASS:-}
+
+source ./tun.logger
+
+set -euo pipefail
+
+LOG INFO "Configuring host $HOST"
+
+trap '' TSTP
+
+if [[ ! -t 0 ]]; then
+    trap '' TTIN TTOU
+fi
+
+CONFIG_MARKER="${DATA_PATH}/tun_host_${HOST}_configured"
+LOAD_MARKER="${DATA_PATH}/tun_host_${HOST}_loaded"
+HOST_EXIT_CODE="${DATA_PATH}/tun_ssh_exit_code_${HOST}"
+KNOWN_HOSTS="${DATA_PATH}/known_hosts"
+
+SESSION=$(cat "${DATA_PATH}/tun_session" 2>/dev/null || true)
+[[ $SESSION =~ ^[0-9a-f]+$ ]] || SESSION=none
+
+BUSY_CHECK='owner=$(cat /tmp/tun_busy 2>/dev/null)
+if [ -n "$owner" ] && [ "$owner" != "'"${SESSION}"'" ] && ls /sys/class/net | grep -q "^tun[0-9]"; then
+    echo "VPS-BUSY: $(date -r /tmp/tun_busy "+%Y-%m-%d %H:%M:%S" 2>/dev/null)"
+    exit 0
+fi'
+
+busy_refused() {
+    local since
+
+    since=$(sed -n 's/^VPS-BUSY: //p' <<< "$1")
+    grep -q '^VPS-BUSY' <<< "$1" || return 1
+
+    LOG ERROR "VPS $HOST is used by another Tunnel Control server (since ${since:-unknown}); its tunnels are left alone. It becomes free when that server stops its tunnels or the VPS reboots"
+    echo "6" > "${HOST_EXIT_CODE}"
+    touch "${DATA_PATH}/tun_host_${HOST}_busy"
+    mkdir -p "${DATA_PATH}/queue"
+    echo "Host $HOST is used by another Tunnel Control server; its tunnels stay off until the tunnels are restarted" \
+        > "${DATA_PATH}/queue/message_$(date +%s%N).notify"
+    return 0
+}
+
+validate_results() {
+    SSH_EXIT_CODE=$1
+    RESULT=$2
+    VALIDATION_PATTERN=$3
+
+    if [ "$SSH_EXIT_CODE" -ne 0 ]; then
+        LOG ERROR "SSH connection to $HOST:$PORT failed with code $SSH_EXIT_CODE"
+
+        case $SSH_EXIT_CODE in
+            255)
+                LOG ERROR "Connection refused, timeout or network unreachable" 
+                ;;
+            1)
+                LOG ERROR "SSH protocol error or authentication failed"
+                ;;
+            2)
+                LOG ERROR "Command line error"
+                ;;
+            5)
+                LOG ERROR "Authentication failed (wrong password)"
+                ;;
+            *)
+                LOG ERROR "Unknown SSH error"
+                ;;
+        esac
+
+        if echo "$RESULT" | grep -qE 'Host key verification failed|IDENTIFICATION HAS CHANGED'; then
+            LOG ERROR "Host key of $HOST does not match ${KNOWN_HOSTS}. If the VPS was reinstalled, remove the old key: ssh-keygen -R $HOST -f ${KNOWN_HOSTS}"
+        fi
+
+        echo "${SSH_EXIT_CODE}" > "${HOST_EXIT_CODE}"
+
+        return 1
+    else
+        LOG INFO "SSH session to $HOST:$PORT established successfully"
+
+        if echo "$RESULT" | grep -q "$VALIDATION_PATTERN"; then
+            LOG INFO "Successfully ($VALIDATION_PATTERN) on $HOST"
+
+            rm -f "${HOST_EXIT_CODE}" 2>/dev/null || true
+            return 0
+        else
+            LOG ERROR "Failed to validate result on $HOST. Output: $RESULT"
+
+            echo "-1" > "${HOST_EXIT_CODE}"
+            return 1
+        fi
+    fi
+}
+
+ssh_with_pass() {
+    LOG INFO "Connecting to $HOST:$PORT with password authentication"
+
+    sshpass -e ssh \
+        -o ConnectTimeout=10 \
+        -o TCPKeepAlive=yes \
+        -o Compression=yes \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="${KNOWN_HOSTS}" \
+        -o HostKeyAlias="${HOST}" \
+        -o PreferredAuthentications=keyboard-interactive,password \
+        -c "$CIPHER" \
+        -p "$PORT" \
+        root@"$HOST" "$@"
+}
+
+ssh_with_key() {
+    LOG INFO "Connecting to $HOST:$PORT with key authentication"
+
+    ssh -T \
+        -o ConnectTimeout=10 \
+        -o ServerAliveInterval=10 \
+        -o ServerAliveCountMax=3 \
+        -o TCPKeepAlive=yes \
+        -o Compression=yes \
+        -o BatchMode=yes \
+        -o StrictHostKeyChecking=accept-new \
+        -o UserKnownHostsFile="${KNOWN_HOSTS}" \
+        -o HostKeyAlias="${HOST}" \
+        -i /root/.ssh/id_ed25519_tun \
+        -c "$CIPHER" \
+        -p "$PORT" \
+        root@"$HOST" "$@"
+}
+
+if [[ ! -f "$CONFIG_MARKER" ]]; then
+    if [[ -z "$PASSWORD" ]]; then
+        LOG ERROR "First time setup requires password"
+        echo "5" > "${HOST_EXIT_CODE}"
+        exit 1
+    fi
+
+    LOG NOTICE "First time setup for $HOST — installing key and configuring sshd"
+
+    # --- Key installation and sshd_config (uses the password) ---
+
+    set +e
+    
+    RESULT=$(ssh_with_pass "${BUSY_CHECK}"'
+        set +e
+        set -o pipefail 2>/dev/null || true
+
+        mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
+        # Install the public key
+
+        KEY=$(cat)
+        if grep -qF "$KEY" /root/.ssh/authorized_keys 2>/dev/null; then
+            # Key already exists
+            echo "Key already exists"
+            :
+        else
+            echo "$KEY" >> /root/.ssh/authorized_keys
+            # Key successfully added
+            echo "Key added"
+        fi
+        chmod 600 /root/.ssh/authorized_keys
+
+        # Configure sshd_config
+
+        CONFIG="/etc/ssh/sshd_config"
+        BACKUP="$CONFIG.bak.$(date +%s)"
+        cp -f "$CONFIG" "$BACKUP" 2>/dev/null || true
+
+        CHANGES=0
+
+        # The parameters we need
+        declare -A params=(
+            ["TCPKeepAlive"]="yes"
+            ["ClientAliveInterval"]="10"
+            ["ClientAliveCountMax"]="3"
+            ["PermitTunnel"]="yes"
+        )
+
+        for key in "${!params[@]}"; do
+            value="${params[$key]}"
+            desired="$key $value"
+
+            if grep -qE "^[[:space:]]*$key[[:space:]]+$value([[:space:]]+#.*)?$" "$CONFIG" 2>/dev/null; then
+                echo "$key correctly set to $value"
+                continue
+            fi
+
+            sed -i "/^[[:space:]]*#*[[:space:]]*$key[[:space:]]/d" "$CONFIG" 2>/dev/null || true
+
+            echo "$desired" >> "$CONFIG"
+            CHANGES=1
+            echo "Applied: $desired"
+        done
+
+        if [[ $CHANGES -gt 0 ]]; then
+            echo "Config sshd changes applied, validating and restarting sshd..."
+
+            if sshd -t; then
+                SSHD_RESTART="/tmp/ssd_restart"
+                echo "Config sshd validation successful, restarting sshd..."
+                rm -f "$SSHD_RESTART" 2>/dev/null || true
+
+                nohup bash -c "
+                    echo \"[\" >&2
+                    systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1
+                    if [ \$? -ne 0 ]; then
+                        echo \"systemctl restart failed, trying service command...\" >&2
+                        service ssh restart >/dev/null 2>&1 || service sshd restart >/dev/null 2>&1
+                        if [ \$? -ne 0 ]; then
+                            echo \"service restart failed, trying init.d script...\" >&2
+                            /etc/init.d/ssh restart >/dev/null 2>&1
+                            if [ \$? -ne 0 ]; then
+                                echo \"init.d restart failed\" >&2
+                                exit 1
+                            else
+                                echo \"init.d restart succeeded\" >&2
+                            fi
+                        fi
+                    fi
+                    echo \"]\" >&2
+                " >"$SSHD_RESTART" 2>&1 &
+                echo "Waiting for sshd restart to complete..."
+
+                TIMEOUT=1
+                for i in {1..15}; do
+                    if grep -q "]" "$SSHD_RESTART" 2>/dev/null; then
+                        TIMEOUT=0
+                        break
+                    fi
+                    sleep 0.5
+                done
+
+                if [ $TIMEOUT -ne 0 ]; then
+                    echo "sshd restart timed out!"
+                else
+                    echo "sshd restart completed."
+                fi
+
+                cat "$SSHD_RESTART" 2>/dev/null || echo "No output from restart command"
+            else
+                echo "sshd config validation failed! Restoring backup..."
+                cp -f "$BACKUP" "$CONFIG" 2>/dev/null || true
+                exit 1
+            fi
+        else
+            echo "All sshd settings already correct — no restart needed"
+        fi
+
+        echo "Configured"
+    ' < "/root/.ssh/id_ed25519_tun.pub" 2>&1)
+
+    EXIT_CODE=$?
+    set -e
+
+    LOG DEBUG "SSH setup output: $RESULT"
+
+    if busy_refused "$RESULT"; then
+        exit 1
+    fi
+
+    if ! validate_results "$EXIT_CODE" "$RESULT" "Configured"; then
+        LOG ERROR "Initial setup failed on $HOST. Output: $RESULT"
+        exit 1
+    fi
+
+    touch "$CONFIG_MARKER"
+    LOG NOTICE "Initial setup completed successfully on $HOST"
+else
+    LOG INFO "Server $HOST already configured, using key authentication"
+fi
+
+rm -f "$LOAD_MARKER" 2>/dev/null || true
+
+SETUP_FILE="./tun.server.setup.${HOST}"
+
+if [[ -f "$SETUP_FILE" ]]; then
+    if grep -q $'\r' "$SETUP_FILE"; then
+        LOG ERROR "tun.server.setup.${HOST} has Windows line endings (CR) and cannot run on the VPS; convert it: sed -i 's/\r\$//' tun.server.setup.${HOST}"
+        echo "-1" > "${HOST_EXIT_CODE}"
+        exit 1
+    fi
+
+    LOG INFO "Found custom setup for $HOST — injecting tun.server.setup.${HOST}"
+
+    SETUP_CONTENT=$(cat "$SETUP_FILE")
+    [[ "${SETUP_CONTENT: -1}" != $'\n' ]] && SETUP_CONTENT+=$'\n'
+
+    FULL_SCRIPT=$(SETUP_CONTENT="$SETUP_CONTENT" awk '
+        /### tun\.setup ###/ {
+            printf "%s", ENVIRON["SETUP_CONTENT"]
+            next
+        }
+        { print }
+    ' ./tun.server)
+else
+    LOG INFO "Using default tun.server for $HOST"
+    FULL_SCRIPT=$(cat ./tun.server)
+fi
+
+VPS_LOG=${LOG_VPS_FILE:-/var/log/tun.log}
+if ! [[ $VPS_LOG =~ ^/[A-Za-z0-9._/-]+$ ]] || [[ $VPS_LOG == */ ]]; then
+    LOG WARN "LOG_VPS_FILE='${VPS_LOG}' is not an absolute file path, using /var/log/tun.log"
+    VPS_LOG=/var/log/tun.log
+fi
+FULL_SCRIPT=$(VPS_LOG="$VPS_LOG" awk '
+    $0 == "LOG=\"/var/log/tun.log\"" {
+        print "LOG=\"" ENVIRON["VPS_LOG"] "\""
+        next
+    }
+    { print }
+' <<< "$FULL_SCRIPT")
+
+set +e
+RESULT=$(echo "$FULL_SCRIPT" | ssh_with_key \
+    "${BUSY_CHECK}
+     echo ${SESSION} > /tmp/tun_busy &&
+     cat > /tmp/tun.start &&
+     chmod +x /tmp/tun.start &&
+     rm -f /tmp/tun_initialized &&
+     exec /tmp/tun.start 0 ${IN_FACE} ${PORT} ${PORT_RANGE} ${PUBLIC_IP} ${OUT_FACE}" 2>&1)
+EXIT_CODE=$?
+set -e
+
+if busy_refused "$RESULT"; then
+    exit 1
+fi
+
+while IFS= read -r PROBLEM; do
+    LOG ERROR "VPS ${HOST}: ${PROBLEM#VPS-PROBLEM: }"
+done < <(grep '^VPS-PROBLEM: ' <<< "$RESULT")
+
+if ! validate_results "$EXIT_CODE" "$RESULT" "Loaded"; then
+    LOG ERROR "Failed to start tun.server on $HOST. Output: $RESULT"
+    exit 1
+else
+    touch "$LOAD_MARKER"
+    LOG NOTICE "tun.server started successfully on $HOST"
+fi

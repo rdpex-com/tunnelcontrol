@@ -1,0 +1,234 @@
+#!/bin/bash
+# tunnelcontrol-vps-traffic: traffic of every tunnel interface on the VPS and in total, every 10 seconds
+
+INTERVAL=10
+NAME="tunnelcontrol-vps-traffic"
+DATA_PATH="/tmp/${NAME}"
+MON_LOG="/var/log/tun.vps.total.log"
+VERBOSE_LOG="/var/log/tun.vps.verbose.log"
+[ "${LOG_LEVEL:-1}" -ge 2 ] 2>/dev/null || { MON_LOG=/dev/null; VERBOSE_LOG=/dev/null; }
+
+export LC_NUMERIC=C
+
+LOG_INFO() {
+    local msg="$1"
+    shift
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $msg" | tee -a "${@:-$MON_LOG}"
+}
+
+read_bytes_file() {
+    local file="$1"
+    local __rx_var="$2"
+    local __tx_var="$3"
+    local rx tx
+
+    [[ -r "$file" ]] || return 1
+    read -r rx tx < "$file"
+    [[ "$rx" =~ ^[0-9]+$ ]] && [[ "$tx" =~ ^[0-9]+$ ]] || return 1
+
+    printf -v "$__rx_var" '%s' "$rx"
+    printf -v "$__tx_var" '%s' "$tx"
+}
+
+write_bytes_file() {
+    echo "$2 $3" > "$1.tmp" && mv -f "$1.tmp" "$1"
+}
+
+format_traffic() {
+    local value=$1
+    local str_var=$2            # name of the string variable (TRX_STR / TTX_STR)
+    local prefix=$3             # "RX" or "TX"
+    local num_fmt=${4:-"%.3f"}  # number format
+    local unit_suffix=${5:-""}  # suffix ("" or "/s")
+    local val unit str
+
+    export LC_NUMERIC=C
+
+    if [ "$value" -ge $((1024*1024*1024)) ]; then
+        val=$(awk "BEGIN {printf \"$num_fmt\", $value/1024/1024/1024}")
+        unit="GB${unit_suffix}"
+    elif [ "$value" -ge $((1024*1024)) ]; then
+        val=$(awk "BEGIN {printf \"$num_fmt\", $value/1024/1024}")
+        unit="MB${unit_suffix}"
+    else
+        val=$(awk "BEGIN {printf \"$num_fmt\", $value/1024}")
+        unit="KB${unit_suffix}"
+    fi
+    str=$(printf "%s:%s %s" "$prefix" "$val" "$unit")
+
+    printf -v "$str_var" '%s' "$str"
+}
+
+record() {
+    local key=$1
+    local rx=$2
+    local tx=$3
+    local speed_rx=$4
+    local speed_tx=$5
+    local label=$1
+    local persist_save=0
+    local RX_STR TX_STR TRX_STR TTX_STR
+
+    [ "$key" = "total" ] && label="[TOTAL]"
+
+    if [ "$rx" -lt "$LAST_RX" ]; then
+        PERSIST_RX=$((PERSIST_RX + LAST_RX))
+        persist_save=1
+    fi
+    if [ "$tx" -lt "$LAST_TX" ]; then
+        PERSIST_TX=$((PERSIST_TX + LAST_TX))
+        persist_save=1
+    fi
+    if [ "$persist_save" = 1 ]; then
+        write_bytes_file "${DATA_PATH}/tun_persist_${key}" "$PERSIST_RX" "$PERSIST_TX"
+        LOG_INFO "${label} Counters restarted, kept RX=${PERSIST_RX} TX=${PERSIST_TX}" "$VERBOSE_LOG"
+    fi
+
+    BYTES_RX=$((PERSIST_RX + rx))
+    BYTES_TX=$((PERSIST_TX + tx))
+    LAST_RX=$rx
+    LAST_TX=$tx
+    write_bytes_file "${DATA_PATH}/tun_bytes_${key}" "$BYTES_RX" "$BYTES_TX"
+    write_bytes_file "${DATA_PATH}/tun_last_${key}" "$LAST_RX" "$LAST_TX"
+
+    format_traffic "$speed_rx" "RX_STR" "RX" "%8.3f" "/s"
+    format_traffic "$speed_tx" "TX_STR" "TX" "%8.3f" "/s"
+    format_traffic "$BYTES_RX" "TRX_STR" "RX" "%8.3f" ""
+    format_traffic "$BYTES_TX" "TTX_STR" "TX" "%8.3f" ""
+
+    printf -v RESULT "%-7s | %s | %s | %s | %s" "$label" "$RX_STR" "$TX_STR" "$TRX_STR" "$TTX_STR"
+}
+
+restore_state() {
+    local key=$1
+
+    read_bytes_file "${DATA_PATH}/tun_persist_${key}" PERSIST_RX PERSIST_TX || { PERSIST_RX=0; PERSIST_TX=0; }
+    read_bytes_file "${DATA_PATH}/tun_last_${key}" LAST_RX LAST_TX || { LAST_RX=0; LAST_TX=0; }
+}
+
+sum_files() {
+    local file
+
+    SUM_RX=0
+    SUM_TX=0
+    for file in "${DATA_PATH}/$1"*; do
+        [ -f "$file" ] || continue
+        [[ "$file" == *.tmp ]] && continue
+        read_bytes_file "$file" FILE_RX FILE_TX || return 1
+        SUM_RX=$((SUM_RX + FILE_RX))
+        SUM_TX=$((SUM_TX + FILE_TX))
+    done
+}
+
+wait_interval() {
+    local tun=$1
+    local i
+
+    for ((i = 0; i < INTERVAL; i++)); do
+        if [ -n "$tun" ] && ! ip link show "$tun" > /dev/null 2>&1; then
+            rm -f "${DATA_PATH}/tun_speed_${tun}"
+            LOG_INFO "${tun} Interface disappeared, monitor stopped" "$VERBOSE_LOG"
+            exit 0
+        fi
+        sleep 1
+    done
+}
+
+tun_monitor() {
+    local TUN=$1
+    local LAST_MEASURE_TIME=""
+    local now elapsed
+
+    restore_state "$TUN"
+
+    while true; do
+        read -r RX TX < <(awk -v dev="${TUN}:" '$1 == dev { print $2, $10 }' /proc/net/dev)
+        if [[ "$RX" =~ ^[0-9]+$ ]] && [[ "$TX" =~ ^[0-9]+$ ]]; then
+            now=$(date +%s%3N)
+            SPEED_RX=0
+            SPEED_TX=0
+            if [ -n "$LAST_MEASURE_TIME" ]; then
+                elapsed=$((now - LAST_MEASURE_TIME))
+                [ "$elapsed" -le 0 ] && elapsed=1
+                [ "$RX" -ge "$LAST_RX" ] && SPEED_RX=$(( (RX - LAST_RX) * 1000 / elapsed ))
+                [ "$TX" -ge "$LAST_TX" ] && SPEED_TX=$(( (TX - LAST_TX) * 1000 / elapsed ))
+            fi
+            LAST_MEASURE_TIME=$now
+
+            record "$TUN" "$RX" "$TX" "$SPEED_RX" "$SPEED_TX"
+            write_bytes_file "${DATA_PATH}/tun_speed_${TUN}" "$SPEED_RX" "$SPEED_TX"
+            LOG_INFO "$RESULT" "$VERBOSE_LOG"
+        fi
+        wait_interval "$TUN"
+    done
+}
+
+total_monitor() {
+    restore_state total
+
+    while true; do
+        SPEED_RX=0
+        SPEED_TX=0
+        if sum_files tun_speed_tun; then
+            SPEED_RX=$SUM_RX
+            SPEED_TX=$SUM_TX
+        fi
+        if sum_files tun_bytes_tun; then
+            record total "$SUM_RX" "$SUM_TX" "$SPEED_RX" "$SPEED_TX"
+            LOG_INFO "$RESULT" "$MON_LOG" "$VERBOSE_LOG"
+        fi
+        wait_interval
+    done
+}
+
+export -f LOG_INFO read_bytes_file write_bytes_file format_traffic record restore_state sum_files wait_interval tun_monitor total_monitor
+export INTERVAL DATA_PATH MON_LOG VERBOSE_LOG
+
+mkdir -p "$DATA_PATH" || exit 1
+exec 9> "${DATA_PATH}/lock"
+if ! flock -n 9; then
+    echo "${NAME} is already running"
+    exit 1
+fi
+pkill -f "^${NAME}-(total|tun[0-9]+) " 2>/dev/null
+rm -f "${DATA_PATH}"/tun_speed_tun*
+
+declare -A MONITORS
+TOTAL_MONITOR_PID=0
+
+start_monitor() {
+    local type=$1
+    local tun=$2
+
+    if [ "$type" = "tun" ]; then
+        (
+            exec -a "${NAME}-${tun}" bash -c "tun_monitor \"${tun}\"" 9>&-
+        ) &
+        MONITORS["$tun"]=$!
+        LOG_INFO "Monitor for ${tun} started (PID: ${MONITORS[$tun]})"
+    else
+        (
+            exec -a "${NAME}-total" bash -c "total_monitor" 9>&-
+        ) &
+        TOTAL_MONITOR_PID=$!
+        LOG_INFO "Total traffic monitor started (PID: ${TOTAL_MONITOR_PID})"
+    fi
+}
+
+trap 'pkill -P $$' EXIT
+trap 'exit 0' INT TERM HUP
+
+LOG_INFO "Starting tun traffic monitoring every ${INTERVAL} s, log level: ${LOG_LEVEL:-1}"
+start_monitor total
+
+while true; do
+    for TUN in $(awk -F: 'NR > 2 { gsub(/ /, "", $1); if ($1 ~ /^tun[0-9]+$/) print $1 }' /proc/net/dev); do
+        if [ -z "${MONITORS[$TUN]}" ] || ! kill -0 "${MONITORS[$TUN]}" 2>/dev/null; then
+            start_monitor tun "$TUN"
+        fi
+    done
+
+    kill -0 "$TOTAL_MONITOR_PID" 2>/dev/null || start_monitor total
+
+    sleep 1
+done

@@ -1,0 +1,5 @@
+* text=auto eol=lf
+.github export-ignore
+.gitattributes export-ignore
+web/watch-version.js export-ignore
+contrib export-ignore

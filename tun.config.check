@@ -1,0 +1,66 @@
+#!/bin/bash
+# tun.config.check [file]
+
+FILE=$(realpath -m "${1:-./tun.config}")
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+SETTINGS=$(grep -oE '^[A-Z][A-Z0-9_]*=' ./tun.defaults | tr -d '=' | paste -sd '|')
+NAME_RE="^(CONFIG|DATA_PATH|${SETTINGS})\$"
+VALUE_RE="(\"[^\"\$\`\\\\]*\"|'[^']*'|[A-Za-z0-9._:/+-]*)"
+COMMENT_RE="([[:space:]]+#.*)?[[:space:]]*"
+
+if [ ! -f "$FILE" ]; then
+    echo "${FILE} not found"
+    exit 1
+fi
+
+ERRORS=0
+IN_ARRAY=0
+N=0
+
+error() {
+    echo "line ${N}: $*"
+    ERRORS=1
+}
+
+while IFS= read -r LINE || [ -n "$LINE" ]; do
+    N=$((N + 1))
+
+    if [[ $LINE == *$'\r' ]]; then
+        error "Windows line ending (CR)"
+        continue
+    fi
+
+    LINE="${LINE#"${LINE%%[![:space:]]*}"}"
+    [ -z "$LINE" ] && continue
+    [[ $LINE == \#* ]] && continue
+
+    if [ "$IN_ARRAY" -eq 1 ]; then
+        if [[ $LINE =~ ^\)${COMMENT_RE}$ ]]; then
+            IN_ARRAY=0
+        elif ! [[ $LINE =~ ^${VALUE_RE}([[:space:]]+${VALUE_RE})*${COMMENT_RE}$ ]]; then
+            error "not a plain quoted value inside TUNNELS: ${LINE}"
+        fi
+        continue
+    fi
+
+    if [[ $LINE =~ ^TUNNELS=\(${COMMENT_RE}$ ]]; then
+        IN_ARRAY=1
+    elif [[ $LINE =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+        NAME=${BASH_REMATCH[1]}
+        VALUE=${BASH_REMATCH[2]}
+        if ! [[ $NAME =~ $NAME_RE ]]; then
+            error "unknown variable ${NAME}"
+        elif ! [[ $VALUE =~ ^${VALUE_RE}${COMMENT_RE}$ ]]; then
+            error "value of ${NAME} must be plain text without \$, \`, \\ or nested quotes: ${VALUE}"
+        fi
+    else
+        error "only variable assignments and comments are allowed: ${LINE}"
+    fi
+done < "$FILE"
+
+if [ "$IN_ARRAY" -eq 1 ]; then
+    error "TUNNELS=( is not closed with )"
+fi
+
+exit "$ERRORS"

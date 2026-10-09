@@ -1,0 +1,21 @@
+[Unit]
+Description=Run Tunnels Script After Network
+After=network-online.target
+Wants=network-online.target
+PartOf=systemd-networkd.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@DIR@
+ExecStart=@DIR@/tun --start
+ExecStop=@DIR@/tun --stop
+ExecStopPost=/bin/sh -c '[ "$SERVICE_RESULT" = success ] || exec @DIR@/tun --kill'
+KillMode=control-group
+TimeoutStopSec=90s
+
+StandardOutput=null
+StandardError=null
+
+[Install]
+WantedBy=multi-user.target

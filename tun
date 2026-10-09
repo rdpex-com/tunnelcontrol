@@ -1,0 +1,746 @@
+#!/bin/bash
+
+WORKING_DIR="$(dirname "$(readlink -f "$0")")"
+
+cd "${WORKING_DIR}"
+
+source ./tun.logger
+
+DATA_PATH_FILE="./.data_path"
+
+if [ "$1" = "--version" ]; then
+    echo "Tunnel Control $(cat ./VERSION)"
+    exit 0
+fi
+
+show_help() {
+    echo "Tunnel Control $(cat ./VERSION)"
+    awk '/^Settings$/ { exit } found { if ($0 == "") { blank++; next } while (blank) { print ""; blank-- } print } /^Commands$/ { found = 1 }' ./tun.readme
+    echo
+    echo "Settings, VPS and the web panel: ${WORKING_DIR}/tun.readme"
+}
+
+case "$1" in
+    --install|--start|--restart|--stop|--kill|--web-password|--update|--status|--monitor|--toggle)
+        ;;
+    --help|-h)
+        show_help
+        exit 0
+        ;;
+    *)
+        [ -n "$1" ] && echo "Unknown command: $1" >&2
+        show_help
+        exit 1
+        ;;
+esac
+
+if [ ! -f ./tun.config ]; then
+    if [ "$1" = "--install" ]; then
+        cp ./tun.config.example ./tun.config
+        ln -sf "${WORKING_DIR}/tun" /usr/local/bin/tun 2>/dev/null || true
+        LOG WARN "tun --install reconfigures this server completely (it resets iptables, takes over the routing, turns on IP forwarding and turns off IPv6) and every VPS in tun.config (sshd_config, a key for root, iptables): use clean systems that run nothing else"
+        LOG NOTICE "tun.config created from tun.config.example: fill in CONFIG and TUNNELS, then run tun --install again"
+    else
+        LOG ERROR "tun.config not found: create it from tun.config.example and run tun --install"
+    fi
+    exit 1
+fi
+
+if cmp -s ./tun.config ./tun.config.example && [ "$1" != "--stop" ] && [ "$1" != "--kill" ]; then
+    LOG ERROR "tun.config is still the example: fill in CONFIG and TUNNELS, then run tun --install"
+    exit 1
+fi
+
+if CONFIG_ERRORS=$(./tun.config.check ./tun.config); then
+    source ./tun.config
+else
+    while IFS= read -r CONFIG_ERROR; do
+        LOG ERROR "tun.config ${CONFIG_ERROR}"
+    done <<< "$CONFIG_ERRORS"
+    if [ "$1" != "--stop" ] && [ "$1" != "--kill" ]; then
+        LOG ERROR "tun.config is not valid, tunnels are not started"
+        exit 1
+    fi
+    DATA_PATH=$(cat "$DATA_PATH_FILE" 2>/dev/null || echo "./data")
+fi
+
+source ./tun.env
+
+CONFIG_DATA_PATH=${DATA_PATH}
+SAVED_DATA_PATH=$(cat "$DATA_PATH_FILE" 2>/dev/null || true)
+if [ -n "$SAVED_DATA_PATH" ] && [ "$(realpath -m "$SAVED_DATA_PATH")" != "$(realpath -m "$CONFIG_DATA_PATH")" ]; then
+    DATA_PATH=$SAVED_DATA_PATH
+fi
+[ -d "$DATA_PATH" ] || { mkdir -p "$(dirname "$DATA_PATH")" && mkdir -m 700 "$DATA_PATH"; } 2>/dev/null || true
+
+export LOG_LEVEL LOG_VPS_FILE
+
+trap '' TSTP
+
+if [[ ! -t 0 ]]; then
+    trap '' TTIN TTOU
+fi
+
+export DATA_PATH
+export LC_ALL=C
+
+LOG DEBUG "Log level ${LOG_LEVEL}, verbose log $VERBOSE_LOG"
+
+TUNNEL_COUNT=${#TUNNELS[@]}
+MODE="balance"
+CIPHER="${TUNNEL_CIPHER}"
+WARN_THROTTLE=${MANAGER_WARN_THROTTLE}
+WATCHDOG=${MANAGER_WATCHDOG}
+
+PID_FILE="${DATA_PATH}/tun_pid"
+START_FILE="${DATA_PATH}/tun_start"
+STOP_FILE="${DATA_PATH}/tun_stop"
+
+kill_mon() {
+    local pid
+    pid=$(cat "$PID_FILE" 2>/dev/null || echo "")
+    if [ -n "$pid" ]; then
+        LOG INFO "Existing PID: $pid"
+        kill -9 "$pid" 2>/dev/null || true
+        rm -f "$PID_FILE" 2>/dev/null || true
+    fi
+}
+
+kill_watchdog() {
+    pkill -f "tun\.watchdog" 2>/dev/null || true
+}
+
+cleanup() {
+    local remove=${1:-stop}
+
+    if [ "${remove}" = "start" ]; then
+        LOG INFO "Remove stop trigger"
+        find "$DATA_PATH" -name "tun_stop" -delete 2>/dev/null || true
+    elif [ "${remove}" = "stop" ]; then
+        LOG INFO "Remove start trigger"
+        find "$DATA_PATH" -name "tun_start" -delete 2>/dev/null || true
+    fi
+
+    kill_watchdog
+    kill_mon
+
+    pkill -f "tun\.monitor" 2>/dev/null || true
+    pkill -f "tun\.rotation\.scheduler" 2>/dev/null || true
+    pkill -f "tun\.test" 2>/dev/null || true
+    pkill -f "tun-monitor-total" 2>/dev/null || true
+    pkill -f "tun-monitor-tun[0-9]*" 2>/dev/null || true
+    pkill -f "${DATA_PATH}/tun_ssh_[0-9]*\.sock" 2>/dev/null || true
+    pkill -f "ssh -w [0-9]*\:[0-9]*" 2>/dev/null || true
+
+    find "$DATA_PATH" -name "tun_stop_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_rotation_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_removed_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_state_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_start_connect_time_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_speed_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_ssh_exit_code_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_remote_sshd_pid_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_weight_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_pingpong_lock_*" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_routing_rebuild.lock" -type d -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_configure_*.lock" -type d -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_host_*.lock" -type d -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_host_*" ! -name "tun_host_*_configured" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_host_*_config.lock" -delete 2>/dev/null || true
+    find "$DATA_PATH" -name "tun_host_*_last_event" -delete 2>/dev/null || true
+
+    LOG INFO "Cleaned up."
+}
+
+check_stop() {
+    if [ -f "${STOP_FILE}" ]; then
+        LOG INFO "Skipping by external signal..."
+        exit 0
+    fi
+}
+
+trigger_start() {
+    local now
+    now=$(date +%s)
+    echo "${now}" > "${START_FILE}"
+}
+
+trigger_stop() {
+    local now
+    now=$(date +%s)
+    echo "${now}" > "${STOP_FILE}"
+}
+
+all_hosts_configured() {
+    local host
+    for host in "${HOST_ORDER[@]}"; do
+        [ -f "${DATA_PATH}/tun_host_${host}_configured" ] || return 1
+    done
+    return 0
+}
+
+other_instance_running() {
+    ps -eo pid=,ppid=,args= | awk -v self=$$ '$1 != self && $2 != self && $0 ~ /\/tun --(start|restart|install)/' | grep -q .
+}
+
+if [ "$1" = "--web-password" ]; then
+    if [ "${WEB_PANEL}" = "0" ]; then
+        echo "The web panel is turned off: WEB_PANEL=0 in tun.config"
+        exit 1
+    fi
+    if ! command -v node > /dev/null 2>&1; then
+        echo "node is not installed, the web panel cannot be used"
+        exit 1
+    fi
+
+    read -r -p "Web panel login: " WEB_LOGIN
+    read -rs -p "Web panel password: " WEB_PASSWORD
+    echo
+    read -rs -p "Repeat the password: " WEB_PASSWORD_REPEAT
+    echo
+
+    if [ -z "$WEB_LOGIN" ] || [ -z "$WEB_PASSWORD" ]; then
+        echo "Login and password must not be empty"
+        exit 1
+    fi
+    if [ "$WEB_PASSWORD" != "$WEB_PASSWORD_REPEAT" ]; then
+        echo "Passwords do not match"
+        exit 1
+    fi
+
+    if ! printf '%s\n%s\n' "$WEB_LOGIN" "$WEB_PASSWORD" | DATA_PATH="$DATA_PATH" node ./web/auth-cli.js; then
+        LOG ERROR "Setting the web panel password failed"
+        exit 1
+    fi
+    LOG NOTICE "Web panel password changed for ${WEB_LOGIN}"
+    exit 0
+fi
+
+if [ "$1" = "--update" ]; then
+    exec ./tun.update
+fi
+
+if [ "$1" = "--status" ]; then
+    exec ./tun.status "${@:2}"
+fi
+
+if [ "$1" = "--monitor" ]; then
+    exec ./tun.status --monitor "${@:2}"
+fi
+
+if [ "$1" = "--toggle" ]; then
+    exec ./tun.toggle "${@:2}"
+fi
+
+if [ "$1" = "--start" ]; then
+    if [ -f "${START_FILE}" ]; then
+        if other_instance_running; then
+            LOG NOTICE "Start signal already exists. Another instance might be running. Exiting."
+            exit 0
+        fi
+
+        LOG WARN "Stale start signal found, no running tun instance. Starting anyway."
+    fi
+
+    LOG NOTICE "Starting all tunnels..."
+
+    trigger_start
+elif [ "$1" = "--restart" ]; then
+    if [ -f "${START_FILE}" ]; then
+        LOG NOTICE "Restarting all tunnels..."
+
+        ./tun --stop
+    else
+        LOG NOTICE "Starting all tunnels..."
+    fi
+
+    trigger_start
+elif [ "$1" = "--stop" ]; then
+    LOG NOTICE "Stopping all tunnels and cleaning up..."
+    
+    trigger_stop
+
+    shopt -s nullglob
+    STATE_FILES=("${DATA_PATH}"/tun_state_*)
+    shopt -u nullglob
+
+    if [ ${#STATE_FILES[@]} -eq 0 ]; then
+        LOG INFO "No active tunnels found."
+
+        cleanup stop
+        exit 0
+    fi
+
+    for state_file in "${STATE_FILES[@]}"; do
+        TUNNEL_ID="${state_file##*tun_state_}"
+        TUNNEL_STOP_FILE="${DATA_PATH}/tun_stop_${TUNNEL_ID}"
+        touch "$TUNNEL_STOP_FILE"
+        LOG INFO "Stop signal sent to tunnel ${TUNNEL_ID}"
+    done
+
+    TIMEOUT=${MANAGER_STOP_TIMEOUT}
+
+    LOG INFO "Waiting up to ${TIMEOUT} seconds for tunnels to stop gracefully..."
+    START_TIME=$(date +%s)
+
+    while true; do
+        CURRENT_TIME=$(date +%s)
+        ELAPSED=$((CURRENT_TIME - START_TIME))
+
+        if [ $ELAPSED -ge "$TIMEOUT" ]; then
+            LOG WARN "Timeout reached (${TIMEOUT}s). Some tunnels may still be running."
+            break
+        fi
+
+        shopt -s nullglob
+        TUNNEL_STOP_FILES=("${DATA_PATH}"/tun_stop_*)
+        shopt -u nullglob
+
+        ALL_DONE=true
+
+        for stop_file in "${TUNNEL_STOP_FILES[@]}"; do
+            if [ ! -s "$stop_file" ]; then
+                ALL_DONE=false
+                break
+            fi
+            STATUS=$(cat "$stop_file" 2>/dev/null)
+            if [ "$STATUS" != "0" ] && [ "$STATUS" != "1" ]; then
+                ALL_DONE=false
+                break
+            fi
+        done
+
+        if [ "$ALL_DONE" = true ]; then
+            LOG NOTICE "All tunnels finished stopping."
+            break
+        fi
+
+        sleep 2
+    done
+
+    cleanup stop
+    exit 0
+elif [ "$1" = "--kill" ]; then
+    LOG NOTICE "Killing all tunnels immediately and cleaning up..."
+
+    cleanup stop
+    exit 0
+elif [ "$1" = "--install" ]; then
+    LOG NOTICE "Installing service, dependencies and starting all tunnels..."
+
+    trigger_start
+fi
+
+source ./tun.env check
+
+DEPS_MODE=check
+[ "$1" = "--install" ] && DEPS_MODE=install
+if ! ./tun.deps "$DEPS_MODE"; then
+    LOG ERROR "Required dependencies are missing, tunnels are not started"
+    rm -f "${START_FILE}" 2>/dev/null || true
+    exit 1
+fi
+
+if [ "$DATA_PATH" != "$CONFIG_DATA_PATH" ]; then
+    if ! ./tun.data.move "$DATA_PATH" "$CONFIG_DATA_PATH"; then
+        LOG ERROR "Moving data to ${CONFIG_DATA_PATH} failed, tunnels are not started"
+        rm -f "${START_FILE}" 2>/dev/null || true
+        exit 1
+    fi
+    DATA_PATH=$CONFIG_DATA_PATH
+    PID_FILE="${DATA_PATH}/tun_pid"
+    START_FILE="${DATA_PATH}/tun_start"
+    STOP_FILE="${DATA_PATH}/tun_stop"
+fi
+echo "$DATA_PATH" > "$DATA_PATH_FILE"
+
+sysctl -w net.ipv4.ip_forward=1 &>/dev/null || true
+sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
+sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
+sysctl -w net.ipv6.conf.lo.disable_ipv6=1 &>/dev/null || true
+
+cleanup start
+
+declare -A HOSTS
+declare -a HOST_ORDER=()
+
+for entry in "${TUNNELS[@]}"; do
+    IFS=':' read -r HOST PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE WEIGHT <<< "$entry"
+    if [[ -z ${HOSTS[$HOST]+x} ]]; then
+        HOST_ORDER+=("$HOST")
+    fi
+    HOSTS["$HOST"]+="$PORT:$PORT_RANGE:$IN_FACE:$PUBLIC_IP:$OUT_FACE:$WEIGHT "
+done
+
+CONFIG_HASH=$(printf '%s\n' "${TUNNELS[@]}" | sha256sum | awk '{print $1}')
+CONFIG_HASH_FILE="${DATA_PATH}/tun_config_hash"
+CLEANUP_NEEDED=false
+CLEANUP_LEVEL=WARN
+
+if [ ! -f "$CONFIG_HASH_FILE" ]; then
+    LOG INFO "First run detected. Initializing clean state."
+    CLEANUP_NEEDED=true
+    CLEANUP_LEVEL=INFO
+else
+    OLD_HASH=$(cat "$CONFIG_HASH_FILE")
+    if [ "$OLD_HASH" != "$CONFIG_HASH" ]; then
+        LOG WARN "Tunnel configuration changed!"
+        LOG WARN "Old: ${OLD_HASH:0:16}... → New: ${CONFIG_HASH:0:16}..."
+        CLEANUP_NEEDED=true
+    fi
+fi
+
+if [ "$CLEANUP_NEEDED" = true ]; then
+    LOG "$CLEANUP_LEVEL" "Performing full cleanup of temporary files and states..."
+
+    find "$DATA_PATH" -name "tun_*" \
+        ! -name "tun_host_*_configured" \
+        ! -name "tun_bytes_total" \
+        ! -name "tun_start" \
+        ! -name "tun_stop" \
+        -delete 2>/dev/null || true
+
+    touch "${DATA_PATH}/tun_bytes_total_adjust"
+
+    LOG INFO "All temporary files and states cleared."
+fi
+
+SETUP_NEEDED=false
+
+for HOST in "${!HOSTS[@]}"; do
+    if [ ! -f "${DATA_PATH}/tun_host_${HOST}_configured" ]; then
+        LOG NOTICE "Host $HOST requires initial setup"
+        SETUP_NEEDED=true
+        break
+    fi
+
+    LOG INFO "Host $HOST already configured, skipping setup"
+done
+
+if [ "$1" = "--install" ] && [ -t 0 ] && [ "${WEB_PANEL}" != "0" ] && [ "${WEB_PUSH_EMAIL}" = "${TUN_ENV_DEFAULTS[WEB_PUSH_EMAIL]}" ]; then
+    echo "Push notifications on Apple devices (iPhone, iPad, Safari on Mac) need a real e-mail address."
+    while true; do
+        read -r -p "E-mail for push notifications [${WEB_PUSH_EMAIL}]: " PUSH_EMAIL
+        [ -z "$PUSH_EMAIL" ] && break
+        if [[ $PUSH_EMAIL =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$ ]]; then
+            if grep -qE '^[[:space:]]*WEB_PUSH_EMAIL=' ./tun.config; then
+                sed -i "s|^[[:space:]]*WEB_PUSH_EMAIL=.*|WEB_PUSH_EMAIL=\"${PUSH_EMAIL}\"|" ./tun.config
+            else
+                [ -n "$(tail -c 1 ./tun.config)" ] && echo >> ./tun.config
+                echo "WEB_PUSH_EMAIL=\"${PUSH_EMAIL}\"" >> ./tun.config
+            fi
+            WEB_PUSH_EMAIL=$PUSH_EMAIL
+            LOG NOTICE "Push notifications e-mail saved to tun.config"
+            break
+        fi
+        echo "Not an e-mail address: ${PUSH_EMAIL}"
+    done
+fi
+
+if [ "$1" = "--install" ]; then
+    WEB_SETUP=./tun.setup.web
+    if [ "${WEB_PANEL}" = "0" ]; then
+        WEB_SETUP=true
+        if [ -f /etc/systemd/system/tun-web.service ]; then
+            LOG NOTICE "WEB_PANEL=0: the web panel is not installed or updated, the existing tun-web service is left as it is"
+        else
+            LOG NOTICE "WEB_PANEL=0: installing without the web panel"
+        fi
+    fi
+    if ! ./tun.setup "$(pwd)" || ! "$WEB_SETUP" "$(pwd)"; then
+        LOG ERROR "Installation failed, tunnels are not started"
+        rm -f "${START_FILE}" 2>/dev/null || true
+        exit 1
+    fi
+fi
+
+if [ "$1" = "--install" ] && [ "$SETUP_NEEDED" = true ]; then
+    set -e
+
+    echo -n "Enter password for SSH connections to remote servers: "
+    read -rs PASSWORD
+    echo
+
+    if [[ -z "$PASSWORD" ]]; then
+        LOG ERROR "Password was not entered. Exiting."
+        exit 1
+    fi
+fi
+
+echo "$CONFIG_HASH" > "$CONFIG_HASH_FILE"
+LOG DEBUG "Current config hash: ${CONFIG_HASH:0:16}..."
+
+mkdir -p /run/tunnelcontrol
+[ -s /run/tunnelcontrol/session ] || od -An -N8 -tx1 /dev/urandom | tr -d ' \n' > /run/tunnelcontrol/session
+cp -f /run/tunnelcontrol/session "${DATA_PATH}/tun_session"
+rm -f "${DATA_PATH}"/tun_host_*_busy
+
+./tun.firewall "${CONFIG}"
+
+sleep 3
+
+declare -A HOST_LOADED
+declare -A HOST_FAILED
+declare -A HOST_TO_PARAMS
+declare -A HOST_TUNS
+declare -A TUN_TO_HOST
+declare -A MONITORS
+
+ROTATION_SCHEDULER_PID=0
+TEST_PID=0
+
+for HOST in "${HOST_ORDER[@]}"; do
+    # Exceptions (high priority)
+    ip rule add from all to "$HOST" table main priority 51 2>/dev/null || true
+
+    read -ra TUNNEL_LIST <<< "${HOSTS[$HOST]}"
+
+    HOST_LOADED["$HOST"]=0    
+    HOST_FAILED["$HOST"]=0
+    HOST_TUNS["$HOST"]=0
+    
+    for tunnel in "${TUNNEL_LIST[@]}"; do
+        IFS=':' read -r PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE WEIGHT <<< "$tunnel"
+        TUN=$((++GLOBAL_TUN))
+
+        HOST_TUNS["$HOST"]=$((HOST_TUNS["$HOST"] + 1))
+        HOST_TO_PARAMS["$HOST"]="$PORT $PORT_RANGE $IN_FACE $PUBLIC_IP $OUT_FACE"
+        TUN_TO_HOST["$TUN"]="$HOST"
+
+        PARAMS="$MODE $TUN $HOST $PORT $PORT_RANGE $IN_FACE $PUBLIC_IP $OUT_FACE $WEIGHT $TUNNEL_COUNT"
+
+        LOG INFO "Starting monitor for tun${TUN} ($HOST:$PORT_RANGE)"
+        nohup ./tun.monitor "$MODE" "$TUN" "$HOST" "$PORT" "$PORT_RANGE" "$IN_FACE" "$PUBLIC_IP" "$OUT_FACE" "$WEIGHT" "$TUNNEL_COUNT" "$CONFIG" >/dev/null 2>&1 &
+
+        MONITORS["$!"]="$PARAMS"
+
+        if [ "${HOST_FAILED[$HOST]}" -eq 1 ]; then
+            LOG DEBUG "Host $HOST previously failed. Skipping tun${TUN}"
+            continue
+        fi
+
+        if [ "${HOST_LOADED[$HOST]}" -eq 0 ]; then
+            if SSHPASS="$PASSWORD" ./tun.server.setup "$HOST" "$PORT" "$PORT_RANGE" "$IN_FACE" "$PUBLIC_IP" "$OUT_FACE" "$CIPHER"; then
+                LOG INFO "Successfully loaded tun.server on $HOST and ready to launch tunnels"
+                HOST_LOADED["$HOST"]=1
+            else
+                HOST_FAILED["$HOST"]=1
+
+                HOST_EXIT_CODE="${DATA_PATH}/tun_ssh_exit_code_${HOST}"
+                HOST_CODE=$(cat "${HOST_EXIT_CODE}" 2>/dev/null || echo "0")
+                
+                if [ "$HOST_CODE" -eq 5 ]; then
+                    LOG ERROR "Authentication failed to load tun.server on $HOST. Check password and SSH configuration. Will retry with longer throttle."
+                elif [ "$HOST_CODE" -eq 6 ]; then
+                    LOG ERROR "Host $HOST is used by another Tunnel Control server. Its tunnels stay off until the tunnels are restarted."
+                elif [ "$HOST_CODE" -eq 0 ]; then
+                    LOG ERROR "Failed to load tun.server on $HOST without an exit code (unexpected abort). Will retry with normal throttle."
+
+                    echo "255" > "${HOST_EXIT_CODE}"
+                else
+                    LOG ERROR "Failed to load tun.server on $HOST. Will retry with normal throttle."
+                fi
+
+                continue
+            fi
+        fi
+    done
+done
+
+if [ -n "$PASSWORD" ]; then
+    if all_hosts_configured; then
+        LOG INFO "Clearing password variable from memory"
+        unset PASSWORD
+    else
+        LOG INFO "Password kept in memory until all hosts complete first-time setup"
+    fi
+fi
+
+LOG INFO "Starting centralized rotation scheduler"
+
+ARGS=()
+for TUN in "${!TUN_TO_HOST[@]}"; do
+    LOG DEBUG "Scheduling rotation for tun${TUN} (${TUN_TO_HOST[$TUN]})"
+    ARGS+=("$TUN" "${TUN_TO_HOST[$TUN]}")
+done
+
+LOG DEBUG "Rotation scheduler arguments: ${ARGS[*]}"
+nohup ./tun.rotation.scheduler "${ARGS[@]}" "${CONFIG}" >/dev/null 2>&1 &
+ROTATION_SCHEDULER_PID=$!
+
+LOG INFO "Starting traffic monitor"
+nohup ./tun.test >/dev/null 2>&1 &
+TEST_PID=$!
+
+LOG NOTICE "All tunnel monitors started"
+
+(
+    sleep 3
+
+    declare -A LAST_WARN_TIME
+    declare -A LAST_ERROR_COUNT
+    declare -A HOST_PREV_STATE
+
+    while true; do
+        check_stop
+
+        if [ -n "${PASSWORD:-}" ] && all_hosts_configured; then
+            unset PASSWORD
+            LOG INFO "All hosts configured, clearing password variable from memory"
+        fi
+
+        for pid in "${!MONITORS[@]}"; do
+            PARAMS="${MONITORS[$pid]}"
+            IFS=' ' read -r MODE TUN HOST PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE WEIGHT TUNNEL_COUNT <<< "$PARAMS"
+            if ! kill -0 "${pid}" 2>/dev/null; then
+                check_stop
+
+                LOG NOTICE "Monitor for tun${TUN} died unexpectedly. Restarting... ${PARAMS}"
+                nohup ./tun.monitor "$MODE" "$TUN" "$HOST" "$PORT" "$PORT_RANGE" "$IN_FACE" "$PUBLIC_IP" "$OUT_FACE" "$WEIGHT" "$TUNNEL_COUNT" "$CONFIG" >/dev/null 2>&1 &
+
+                MONITORS["$!"]="$PARAMS"
+                unset 'MONITORS[$pid]'
+
+                LOG INFO "Monitor for tun${TUN} restarted with new PID $!"
+            fi
+        done
+
+        LOG DEBUG "Monitors: ${#MONITORS[@]}"
+
+        declare -A HOST_ERRORS=()
+        declare -A HOST_TOTAL=()
+
+        for TUN in "${!TUN_TO_HOST[@]}"; do
+            HOST=${TUN_TO_HOST[$TUN]}
+            TUN_CODE=$(cat "${DATA_PATH}/tun_ssh_exit_code_${TUN}" 2>/dev/null || echo "0")
+            HOST_CODE=$(cat "${DATA_PATH}/tun_ssh_exit_code_${HOST}" 2>/dev/null || echo "0")
+
+            HOST_TOTAL["$HOST"]=$(( ${HOST_TOTAL[$HOST]:-0} + 1 ))
+
+            if [ "$HOST_CODE" -ne 0 ]; then
+                HOST_ERRORS["$HOST"]=${HOST_TUNS["$HOST"]}
+                continue
+            fi
+
+            if [ "$TUN_CODE" = "255" ] || [ "$TUN_CODE" -eq 255 ]; then
+                HOST_ERRORS["$HOST"]=$(( ${HOST_ERRORS[$HOST]:-0} + 1 ))
+            fi
+        done
+
+        NOW=$(date +%s)
+
+        for HOST in "${!HOST_TOTAL[@]}"; do
+            [ -f "${DATA_PATH}/tun_host_${HOST}_busy" ] && continue
+
+            TOTAL=${HOST_TOTAL[$HOST]}
+            ERRORS=${HOST_ERRORS[$HOST]:-0}
+
+            LOG DEBUG "Host $HOST: $ERRORS out of $TOTAL tunnels"
+
+            if [ "$ERRORS" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+                CURRENT_STATE="DEAD"
+            else
+                CURRENT_STATE="OK"
+            fi
+
+            PREV_STATE=${HOST_PREV_STATE[$HOST]:-OK}
+
+            if [ "$CURRENT_STATE" != "$PREV_STATE" ]; then
+                NOTIFICATION_FILE="${DATA_PATH}/queue/message_$(date +%s%N).notify"
+
+                if [ "$CURRENT_STATE" = "DEAD" ]; then
+                    LOG ERROR "Host $HOST state changed: OK → DEAD (${TOTAL} tunnels)"
+                    
+                    echo "Host $HOST is now DEAD ($TOTAL tunnels failed)" > "$NOTIFICATION_FILE"
+                else
+                    LOG NOTICE "Host $HOST state changed: DEAD → OK"
+                    
+                    echo "Host $HOST has recovered ($TOTAL tunnels OK)" > "$NOTIFICATION_FILE"
+                fi
+
+                HOST_PREV_STATE["$HOST"]="$CURRENT_STATE"
+            fi
+
+            if [ "$ERRORS" -gt 0 ]; then
+                LAST_HOST_WARN_TIME=${LAST_WARN_TIME[$HOST]:-0}
+                LAST_HOST_ERROR_COUNT=${LAST_ERROR_COUNT[$HOST]:-0}
+
+                if [ "$ERRORS" -gt "$LAST_HOST_ERROR_COUNT" ] || [ $((NOW - LAST_HOST_WARN_TIME)) -ge "$WARN_THROTTLE" ]; then
+                    if [ "$ERRORS" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+                        LOG ERROR "ALL tunnels to host $HOST are dead or not configured. ${TOTAL} tunnels failed."
+
+                        PARAMS=${HOST_TO_PARAMS["$HOST"]}
+                        IFS=' ' read -r PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE <<< "$PARAMS"
+
+                        if SSHPASS="$PASSWORD" ./tun.server.setup "$HOST" "$PORT" "$PORT_RANGE" "$IN_FACE" "$PUBLIC_IP" "$OUT_FACE" "$CIPHER"; then
+                            LOG INFO "Successfully loaded tun.server on $HOST and ready to relaunch tunnels"
+
+                            for TUN in "${!TUN_TO_HOST[@]}"; do
+                                if [ "$HOST" = "${TUN_TO_HOST[$TUN]}" ]; then
+                                    LOG DEBUG "Resetting SSH exit code for tun${TUN}"
+                                    rm -f "${DATA_PATH}/tun_ssh_exit_code_${TUN}" 2>/dev/null || true
+                                fi
+                            done
+
+                            rm -f "${DATA_PATH}/tun_ssh_exit_code_${HOST}" 2>/dev/null || true
+
+                            HOST_LOADED["$HOST"]=1
+                            HOST_FAILED["$HOST"]=0
+                        else
+                            LOG ERROR "Failed to load tun.server on $HOST. Skipping all tunnels for this host."
+
+                            HOST_CODE=$(cat "${DATA_PATH}/tun_ssh_exit_code_${HOST}" 2>/dev/null || echo "0")
+
+                            if [ "$HOST_CODE" -eq 5 ]; then
+                                LOG ERROR "Authentication failed for $HOST. Check password and SSH configuration. Will retry with longer throttle."
+                                NOW=$((NOW + WARN_THROTTLE * 10))
+                            elif [ "$HOST_CODE" -eq 6 ]; then
+                                LOG ERROR "Host $HOST is used by another Tunnel Control server. Its tunnels stay off until the tunnels are restarted."
+                            else
+                                NOW=$((NOW + WARN_THROTTLE))
+                            fi
+                        fi
+                    else
+                        LOG WARN "$ERRORS out of $TOTAL tunnels to $HOST have SSH error"
+                    fi
+
+                    LAST_WARN_TIME["$HOST"]=$NOW
+                    LAST_ERROR_COUNT["$HOST"]=$ERRORS
+                fi
+            else
+                if [ -n "${LAST_ERROR_COUNT[$HOST]}" ]; then
+                    LOG INFO "Tunnels to $HOST have recovered. Resetting warning state."
+                fi
+
+                unset 'LAST_WARN_TIME[$HOST]' 2>/dev/null || true
+                unset 'LAST_ERROR_COUNT[$HOST]' 2>/dev/null || true
+            fi
+        done
+
+        if ! kill -0 "$ROTATION_SCHEDULER_PID" 2>/dev/null; then
+            check_stop
+        
+            LOG NOTICE "Rotation scheduler died unexpectedly. Restarting..."
+            nohup ./tun.rotation.scheduler "${ARGS[@]}" "${CONFIG}" >/dev/null 2>&1 &
+            ROTATION_SCHEDULER_PID=$!
+        fi
+
+        if ! kill -0 "$TEST_PID" 2>/dev/null; then
+            check_stop
+
+            LOG NOTICE "Traffic monitor died unexpectedly. Restarting..."
+            nohup ./tun.test >/dev/null 2>&1 &
+            TEST_PID=$!
+        fi
+
+        sleep 2
+    done
+) &
+
+echo "$!" > "$PID_FILE"
+LOG INFO "Main tunnel manager PID: $!"
+
+if [ "$WATCHDOG" = true ]; then
+    LOG INFO "Starting watchdog for main tunnel manager"
+    nohup ./tun.watchdog "$PID_FILE" >/dev/null 2>&1 &
+fi

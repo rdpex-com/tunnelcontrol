@@ -1,0 +1,26 @@
+[Unit]
+Description=Tunnel Web Management Interface
+After=network-online.target
+Wants=network-online.target
+PartOf=systemd-networkd.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=@DIR@
+ExecStart=@DIR@/tun.web
+
+Restart=always
+RestartSec=5
+
+ExecStartPre=/bin/mkdir -p /var/log
+ExecStartPre=/bin/touch /var/log/tun.web.log
+ExecStartPre=/bin/chown root:root /var/log/tun.web.log
+ExecStartPre=/bin/chmod 640 /var/log/tun.web.log
+
+StandardOutput=append:/var/log/tun.web.log
+StandardError=append:/var/log/tun.web.log
+
+[Install]
+WantedBy=multi-user.target

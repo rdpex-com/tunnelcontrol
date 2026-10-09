@@ -1,0 +1,263 @@
+#!/bin/bash
+# tun.status [--monitor [seconds]]
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+cd "$(dirname "$(readlink -f "$0")")" || exit 1
+
+MONITOR=0
+INTERVAL=3
+if [ "${1:-}" = "--monitor" ]; then
+    MONITOR=1
+    INTERVAL=${2:-3}
+    if ! [[ $INTERVAL =~ ^[0-9]+([.][0-9]+)?$ ]] || [[ $INTERVAL =~ ^0+([.]0+)?$ ]]; then
+        echo "Usage: tun --monitor [seconds between refreshes, 3 by default]"
+        exit 1
+    fi
+    if [ ! -t 0 ] || [ ! -t 1 ]; then
+        echo "tun --monitor needs a terminal, use tun --status instead"
+        exit 1
+    fi
+elif [ -n "${1:-}" ]; then
+    echo "Usage: tun --status"
+    exit 1
+fi
+
+source ./tun.env
+
+human_bytes() {
+    awk -v b="${1:-0}" 'BEGIN {
+        split("B KB MB GB TB", unit, " ")
+        i = 1
+        while (b >= 1024 && i < 5) { b /= 1024; i++ }
+        if (i == 1) printf "%d %s", b, unit[i]; else printf "%.1f %s", b, unit[i]
+    }'
+}
+
+speed_bytes() {
+    awk -v content="$1" -v direction="$2" 'BEGIN {
+        number = 0
+        if (match(content, direction ":[ ]*[0-9.]+[ ]*[KMG]?B")) {
+            value = substr(content, RSTART, RLENGTH)
+            sub(direction ":[ ]*", "", value)
+            number = value + 0
+            if (value ~ /KB/) number *= 1024
+            else if (value ~ /MB/) number *= 1048576
+            else if (value ~ /GB/) number *= 1073741824
+        }
+        printf "%d", number
+    }'
+}
+
+clock() {
+    [[ $1 =~ ^[0-9]+$ ]] || { echo "-"; return; }
+    if [ "$(date -d "@$1" +%F)" = "$(date +%F)" ]; then
+        date -d "@$1" +%H:%M:%S
+    else
+        date -d "@$1" "+%m-%d %H:%M"
+    fi
+}
+
+read_file() {
+    cat "${DATA_PATH}/$1" 2>/dev/null
+}
+
+row() {
+    printf '%-10s %-8s %-15s %-6s %-7s %-11s %-11s %-10s %s\n' "$@"
+}
+
+tunnel_ids() {
+    find "${DATA_PATH}" -maxdepth 1 -name 'tun_state_*' -printf '%f\n' 2>/dev/null | sed 's/^tun_state_//' | grep -E '^[0-9]+$' | sort -n
+}
+
+hosts_in_order() {
+    local id
+    for id in $(tunnel_ids); do
+        read_file "tun_host_${id}" | cut -d: -f1
+    done | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | awk '!seen[$0]++'
+}
+
+print_sysinfo() {
+    echo
+    echo "System Information"
+    ./tun.sysinfo --once 2>/dev/null | awk -v RS='|' '{
+        gsub(/^[ \t\n]+|[ \t\n]+$/, "")
+        colon = index($0, ":")
+        if (colon < 2) next
+        value = substr($0, colon + 1)
+        gsub(/^[ \t]+/, "", value)
+        if (value == "") next
+        line = line (line == "" ? "" : "   ") substr($0, 1, colon - 1) ": " value
+    } END { print (line == "" ? "-" : line) }'
+}
+
+print_status() {
+    local numbered=$1
+    local pid manager service web scheme web_port address iface online total_speed total_rx total_tx
+    local id state host_info host public_ip speed rx tx host_state number prefix
+    local -a ids hosts host_tunnels
+
+    pid=$(read_file tun_pid)
+    if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+        if grep -q '/tun\.service$' "/proc/${pid}/cgroup" 2>/dev/null; then
+            manager="running as the tun service (PID ${pid})"
+        else
+            manager="running from the console (PID ${pid})"
+        fi
+    else
+        manager="stopped"
+    fi
+
+    service=$(systemctl is-active tun 2>/dev/null)
+    if [ "$(systemctl is-enabled tun 2>/dev/null)" = "enabled" ]; then
+        service="${service:-unknown}, enabled at boot"
+    else
+        service="${service:-unknown}, not enabled at boot"
+    fi
+
+    if [ -f /etc/systemd/system/tun-web.service ]; then
+        scheme=https
+        web_port=${WEB_HTTPS_PORT}
+        if [ "${WEB_HTTPS}" != "1" ]; then
+            scheme=http
+            web_port=${WEB_HTTP_PORT}
+        fi
+        address=${WEB_LISTEN}
+        if [ -z "$address" ] || [ "$address" = "0.0.0.0" ]; then
+            iface=$(sed -n 's/^[[:space:]]*CONFIG="\([^:"]*\):.*/\1/p' ./tun.config | tail -n 1)
+            address=$(ip -4 -o addr show dev "${iface}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)
+        fi
+        web="${scheme}://${address:-<server address>}:${web_port} ($(systemctl is-active tun-web 2>/dev/null))"
+    elif [ "${WEB_PANEL}" = "0" ]; then
+        web="not installed (WEB_PANEL=0)"
+    else
+        web="not installed"
+    fi
+
+    echo "Tunnel Control™ Panel $(cat ./VERSION)"
+    echo "Tunnels: ${manager}; tun service: ${service}"
+    echo "Web panel: ${web}"
+    echo
+
+    mapfile -t ids < <(tunnel_ids)
+
+    online=0
+    for id in "${ids[@]}"; do
+        [ "$(read_file "tun_state_${id}" | cut -d: -f1)" = "ONLINE" ] && online=$((online + 1))
+    done
+
+    total_speed=$(read_file tun_speed_total)
+    read -r total_rx total_tx < <(read_file tun_bytes_total)
+    echo "Global Stats"
+    printf '%-16s %-14s %-16s %-14s %s\n' "Total RX Speed" "$(human_bytes "$(speed_bytes "$total_speed" RX)")/s" \
+        "Total TX Speed" "$(human_bytes "$(speed_bytes "$total_speed" TX)")/s" "Active Tunnels  ${online} / ${#ids[@]}"
+    printf '%-16s %-14s %-16s %s\n' "Total RX Bytes" "$(human_bytes "${total_rx:-0}")" \
+        "Total TX Bytes" "$(human_bytes "${total_tx:-0}")"
+    echo
+    echo "Active Tunnels"
+
+    if [ ${#ids[@]} -eq 0 ]; then
+        echo
+        echo "No tunnels found"
+    fi
+
+    mapfile -t hosts < <(hosts_in_order)
+    number=0
+    for host in "${hosts[@]}"; do
+        number=$((number + 1))
+        host_tunnels=()
+        public_ip=""
+        for id in "${ids[@]}"; do
+            host_info=$(read_file "tun_host_${id}")
+            [ "${host_info%%:*}" = "$host" ] || continue
+            host_tunnels+=("$id")
+            [ -z "$public_ip" ] && public_ip=$(cut -d: -f3 <<< "$host_info")
+        done
+        [ "$public_ip" = "NA" ] && public_ip=""
+        host_state=enabled
+        if [ -f "${DATA_PATH}/tun_host_${host}_disabled" ] && [ ! -f "${DATA_PATH}/tun_host_${host}_enabled" ]; then
+            host_state=disabled
+        fi
+        prefix=""
+        [ "$numbered" = "1" ] && prefix="[${number}] "
+        echo
+        echo "${prefix}${host}${public_ip:+ (${public_ip})}, ${#host_tunnels[@]} tunnels: ${host_state}"
+        row TUNNEL STATE SINCE PORT WEIGHT "RX SPEED" "TX SPEED" "RX TOTAL" "TX TOTAL"
+        for id in "${host_tunnels[@]}"; do
+            state=$(read_file "tun_state_${id}")
+            host_info=$(read_file "tun_host_${id}")
+            speed=$(read_file "tun_speed_tun${id}")
+            read -r rx tx < <(read_file "tun_bytes_tun${id}")
+            row "Tunnel ${id}" "${state%%:*}" "$(clock "${state#*:}")" "$(cut -d: -f2 <<< "$host_info")" \
+                "$(read_file "tun_weight_${id}")" \
+                "$(human_bytes "$(speed_bytes "$speed" RX)")/s" "$(human_bytes "$(speed_bytes "$speed" TX)")/s" \
+                "$(human_bytes "${rx:-0}")" "$(human_bytes "${tx:-0}")"
+        done
+    done
+
+    print_sysinfo
+}
+
+keys_hint() {
+    local count
+    count=$(hosts_in_order | wc -l)
+    [ "$count" -gt 9 ] && count=9
+    if [ "$count" -eq 1 ]; then
+        echo "Keys: 1 turns the host on or off, q quits"
+    elif [ "$count" -gt 1 ]; then
+        echo "Keys: 1-${count} turn a host on or off, q quits"
+    else
+        echo "Keys: q quits"
+    fi
+}
+
+if [ "$MONITOR" = "0" ]; then
+    print_status 0
+    exit 0
+fi
+
+TTY_SETTINGS=$(stty -g)
+
+quit() {
+    stty "$TTY_SETTINGS"
+    printf '\033[?25h\n'
+    exit 0
+}
+
+QUIT=0
+trap 'QUIT=1' INT TERM
+stty -echo -icanon
+printf '\033[?25l\033[H\033[2J'
+
+MESSAGE=""
+MESSAGE_UNTIL=0
+while true; do
+    [ "$SECONDS" -ge "$MESSAGE_UNTIL" ] && MESSAGE=""
+    FRAME=$(print_status 1; echo; echo "${MESSAGE}"; echo "$(keys_hint). Refreshing every ${INTERVAL} s ($(date +%H:%M:%S))")
+    [ "$QUIT" = "1" ] && quit
+    printf '\033[H%s\033[K\033[J' "${FRAME//$'\n'/$'\033[K\n'}"
+    TIMEOUT=$INTERVAL
+    if [ -n "$MESSAGE" ]; then
+        LEFT=$((MESSAGE_UNTIL - SECONDS))
+        [ "$LEFT" -lt 1 ] && LEFT=1
+        TIMEOUT=$(awk -v interval="$INTERVAL" -v left="$LEFT" 'BEGIN { print (interval < left) ? interval : left }')
+    fi
+    KEY=""
+    read -rsn1 -t "$TIMEOUT" KEY
+    [ "$QUIT" = "1" ] && quit
+    case "$KEY" in
+        q|Q)
+            quit
+            ;;
+        [1-9])
+            mapfile -t HOSTS < <(hosts_in_order)
+            if [ "$KEY" -le "${#HOSTS[@]}" ]; then
+                MESSAGE="$(date +%H:%M:%S) $(./tun.toggle "${HOSTS[$((KEY - 1))]}" 2>&1 | tail -n 1)"
+                MESSAGE_UNTIL=$((SECONDS + 10))
+            fi
+            ;;
+    esac
+done

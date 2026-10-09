@@ -1,0 +1,6 @@
+tun.config
+tun.server.setup.*
+data/
+bak/
+.data_path
+node_modules/

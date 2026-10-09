@@ -1,0 +1,41 @@
+{
+  "name": "Tunnel Control Panel",
+  "short_name": "TunControl",
+  "description": "Management interface for tunnel system",
+  "start_url": "/index.html",
+  "display": "standalone",
+  "display_override": ["standalone"],
+  "orientation": "portrait-primary",
+  "background_color": "#0a0f1c",
+  "theme_color": "#0a0f1c",
+  "scope": "/",
+  "id": "tuncontrol",
+  "icons": [
+    {
+      "src": "img/image256.png",
+      "sizes": "256x256",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "img/image256.png",
+      "sizes": "256x256",
+      "type": "image/png",
+      "purpose": "monochrome"
+    },
+    {
+      "src": "img/image512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "img/image512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "monochrome"
+    }
+  ],
+  "categories": ["productivity"],
+  "prefer_related_applications": false
+}

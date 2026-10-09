@@ -1,0 +1,211 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="screen-orientation" content="portrait">
+
+    <title>Tunnel Control Panel</title>
+
+    <script>
+        window.online = true;
+
+        (function () {
+            const originalFetch = window.fetch.bind(window);
+            window.fetch = async (...args) => {
+                const response = await originalFetch(...args);
+                const url = String(args[0] && args[0].url ? args[0].url : args[0]);
+                if (response.status === 401 && !url.includes('/api/auth/') && !window.redirectingToLogin) {
+                    window.redirectingToLogin = true;
+                    location.replace('/login.html');
+                }
+                return response;
+            };
+        })();
+    </script>
+
+    <script src="js/app/platform-early.js"></script>
+    <script src="js/app/recovery.js"></script>
+    <script src="js/tailwind.min.js"></script>
+    <script src="js/htmx.min.js"></script>
+    
+    <script>
+        const tabHashes = {
+            0: 'dashboard',
+            1: 'config',
+            2: 'logs',
+            3: 'system'
+        };
+
+        const hashToTab = {
+            'dashboard': 0,
+            'config': 1,
+            'logs': 2,
+            'system': 3
+        };
+    </script>
+
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+        };
+
+        function applyTheme(theme) {
+            const html = document.documentElement;            
+            html.classList.remove('dark', 'light');
+            
+            if (theme === 'light') {
+                html.classList.add('light');
+                html.style.setProperty('color-scheme', 'light', 'important');
+            } else {
+                html.classList.add('dark');
+                html.style.setProperty('color-scheme', 'dark', 'important');
+            }
+
+            // Force refresh for the Tailwind CDN
+            void html.offsetWidth;
+            setTimeout(() => void html.offsetWidth, 10);
+        }
+
+        function initTheme() {
+            const savedTheme = localStorage.getItem('theme');
+            
+            if (savedTheme) {
+                applyTheme(savedTheme);
+            } else {
+                // Automatic, follows the system
+                const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+                applyTheme(prefersDark ? 'dark' : 'light');
+            }
+        }
+
+        // System theme listener
+        window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', (e) => {
+            // Only if the user did NOT choose the theme manually
+            if (!localStorage.getItem('theme')) {
+                applyTheme(e.matches ? 'dark' : 'light');
+            }
+        });
+
+        // Start
+        initTheme();
+
+        // Manual switch
+        window.toggleTheme = function(checkbox) {
+            newTheme = checkbox.checked ? 'dark' : 'light';
+            localStorage.setItem('theme', newTheme);
+            applyTheme(newTheme);
+        }
+    </script>
+
+    <link rel="stylesheet" href="css/fontawesome.min.css">    
+    <link rel="stylesheet" href="css/style.css">
+
+    <link rel="icon" type="image/png" href="favicon.png">
+
+    <link rel="manifest" href="manifest.json">
+
+    <meta name="theme-color" content="#f3f4f6" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#0a0f1c" media="(prefers-color-scheme: dark)">
+    <meta name="color-scheme" content="light dark">
+
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="msapplication-TileColor" content="#0a0f1c">    
+</head>
+<body class="bg-white dark:bg-gray-950 text-gray-900 dark:text-gray-100">    
+    <!-- Background Overlay -->
+    <div id="background-overlay"
+        class="fixed inset-0 bg-white dark:bg-[#0a0f1c] z-[9999] transition-opacity duration-100">
+    </div>
+
+    <div id="content-container" class="max-w-7xl mx-auto p-6 relative z-10">        
+        <!-- Header -->
+        <div class="flex justify-between items-start mb-8 border-b border-gray-200 dark:border-gray-800 pb-6" id="header-container">
+            <div id="title-wrapper" style="display: contents;">
+                <div class="flex items-start gap-3">
+                    <img id="header-icon" src="img/imageR.png" alt="Tunnel" 
+                         class="w-9 h-9 drop-shadow-[0_0_0_2px_#60a5fa] drop-shadow-[0_0_3px_#60a5fa] drop-shadow-[0_0_12px_rgba(96,165,250,0.5)] md:hidden hidden">
+                    
+                    <div class="pt-0.5">
+                        <h1 id="main-title" class="text-3xl font-bold leading-none text-gray-900 dark:text-white">Tunnel Control™ Panel</h1>
+                        <span id="app-version" class="text-sm text-gray-500 dark:text-gray-400 block mt-[-2px]">&nbsp;</span>
+                    </div>
+                </div>
+                
+                <div id="status-container" class="flex items-center gap-3 justify-start">
+                    <div id="service-dot" class="w-4 h-4 rounded-full bg-yellow-500"></div>
+                    <span id="service-status" class="text-xl font-semibold text-gray-900 dark:text-white">NA</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Debug Info -->
+        <div id="debug-info" 
+             class="text-sm text-gray-500 dark:text-gray-400 mt-6 p-4 bg-gray-100 dark:bg-gray-950 border border-gray-200 dark:border-gray-800 rounded-2xl md:hidden hidden">
+            <div class="flex justify-between items-center mb-2">
+                <strong>Debug Info:
+                    <span class="text-xs text-gray-400 dark:text-gray-500 mb-3 pl-1">
+                        <span id="debug-modules" class="font-medium"></span>
+                    </span>
+                </strong>
+                <button onclick="window.clearDebug()" 
+                        class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
+                    Clear
+                </button>
+            </div>            
+            <pre id="debug-content" class="font-mono text-xs whitespace-pre-wrap max-h-96 overflow-auto"></pre>
+        </div>
+
+        <!-- Tabs -->
+        <div class="flex border-b border-gray-200 dark:border-gray-800 mb-8" id="tabs">
+            <button onclick="window.switchTab(0)" class="tab-button tab-active px-8 py-4 text-lg font-medium" data-tab="0">Dashboard</button>
+            <button onclick="window.switchTab(1)" class="tab-button px-8 py-4 text-lg font-medium" data-tab="1">Configuration</button>
+            <button onclick="window.switchTab(2)" class="tab-button px-8 py-4 text-lg font-medium" data-tab="2">Logs</button>
+            <button onclick="window.switchTab(3)" class="tab-button px-8 py-4 text-lg font-medium" data-tab="3">System</button>
+        </div>
+
+        <!-- Content -->
+        <div id="tab-content" class="hidden"></div>
+
+        <!-- System Information -->
+        <div class="mt-6 pt-6 border-t border-gray-200 dark:border-gray-800 hidden" id="system-info">
+            <h2 class="text-2xl font-semibold mb-4 text-gray-900 dark:text-white">System Information</h2>
+            <div class="bg-gray-100 dark:bg-gray-900 rounded-2xl p-6 border border-gray-300 dark:border-gray-700">
+                <div id="sysinfo-content" class="font-mono text-gray-700 dark:text-gray-300 text-sm">
+                    Loading system info...
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Bottom Navigation -->
+    <div id="bottom-nav" 
+         class="hidden fixed bottom-0 left-0 right-0 bg-gray-100 dark:bg-gray-900 border-t border-gray-200 dark:border-gray-700 z-50">
+        <div class="flex items-center justify-around py-0.1 max-w-7xl mx-auto">            
+            <button onclick="window.switchTab(0)" class="bottom-nav-btn flex flex-col items-center py-1.5 px-6 text-gray-500 dark:text-gray-400" data-tab="0">
+                <i class="fas fa-house text-xl mb-0.1"></i>
+                <span class="text-xs font-medium">Dashboard</span>
+            </button>
+            
+            <button onclick="window.switchTab(1)" class="bottom-nav-btn flex flex-col items-center py-1.5 px-6 text-gray-500 dark:text-gray-400" data-tab="1">
+                <i class="fas fa-gear text-xl mb-0.1"></i>
+                <span class="text-xs font-medium">Configuration</span>
+            </button>
+            
+            <button onclick="window.switchTab(2)" class="bottom-nav-btn flex flex-col items-center py-1.5 px-6 text-gray-500 dark:text-gray-400" data-tab="2">
+                <i class="fas fa-file-lines text-xl mb-0.1"></i>
+                <span class="text-xs font-medium">Logs</span>
+            </button>
+            
+            <button onclick="window.switchTab(3)" class="bottom-nav-btn flex flex-col items-center py-1.5 px-6 text-gray-500 dark:text-gray-400" data-tab="3">
+                <i class="fas fa-server text-xl mb-0.1"></i>
+                <span class="text-xs font-medium">System</span>
+            </button>            
+        </div>
+    </div>
+
+    <script src="js/chart.umd.min.js"></script>
+    <script type="module" src="js/app/main.js"></script>
+</body>
+</html>

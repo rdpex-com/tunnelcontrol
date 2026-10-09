@@ -1,0 +1,25 @@
+#!/bin/bash
+# tunnelcontrol-guestinfo <path to the .vmx of the Tunnel Control VM>
+
+VMX=${1:-}
+LOCK_FILE="/tmp/tunnelcontrol-guestinfo.lock"
+
+if [ -z "$VMX" ] || [ ! -f "$VMX" ]; then
+    echo "Usage: $0 <path to the .vmx of the Tunnel Control VM>"
+    exit 1
+fi
+
+exec 9> "$LOCK_FILE"
+if ! flock -n 9; then
+    echo "[$(date '+%H:%M:%S')] Already running"
+    exit 0
+fi
+
+INFO=$("$(dirname "$(readlink -f "$0")")/tunnelcontrol-host-info" --once)
+
+if ! vmrun -T ws writeVariable "$VMX" guestVar sysinfo "$INFO"; then
+    echo "[$(date '+%H:%M:%S')] vmrun could not write guestinfo.sysinfo to ${VMX}"
+    exit 1
+fi
+
+echo "[$(date '+%H:%M:%S')] sysinfo updated"

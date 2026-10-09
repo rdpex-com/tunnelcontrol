@@ -1,0 +1,50 @@
+#!/bin/bash
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+WORKING_DIR="${1:-$(dirname "$(readlink -f "$0")")}"
+SERVICE_NAME="tun.service"
+SYSTEMD_PATH="/etc/systemd/system/${SERVICE_NAME}"
+SERVICE_FILE="${WORKING_DIR}/${SERVICE_NAME}"
+KEY_FILE="/root/.ssh/id_ed25519_tun"
+
+source ./tun.logger
+
+ln -sf "${WORKING_DIR}/tun" /usr/local/bin/tun 2>/dev/null || true
+
+if [ ! -f "$KEY_FILE" ]; then
+    LOG INFO "Key not found, generation..."
+    ssh-keygen -q -t ed25519 -N "" -C "tun-tunnel" -f "$KEY_FILE"
+fi
+
+LOG INFO "Installing service ${SERVICE_NAME}..."
+
+rm -f "${SYSTEMD_PATH}"
+sed "s|@DIR@|${WORKING_DIR}|g" "${SERVICE_FILE}" > "${SYSTEMD_PATH}"
+
+systemctl daemon-reload
+systemctl enable "${SERVICE_NAME}"
+
+if [ -d /etc/logrotate.d ]; then
+    cat > /etc/logrotate.d/tun <<'EOF'
+/var/log/tun*.log {
+    su root root
+    size 10M
+    rotate 2
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+    LOG INFO "Log rotation installed: /etc/logrotate.d/tun"
+else
+    LOG WARN "logrotate is not installed, the logs in /var/log are not rotated"
+fi
+
+LOG NOTICE "Service ${SERVICE_NAME} installed and enabled."
+LOG INFO "Working directory: ${WORKING_DIR}"
+LOG INFO "To start manually: tun --stop && systemctl start ${SERVICE_NAME} or reboot the system."

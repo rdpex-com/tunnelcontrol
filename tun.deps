@@ -1,0 +1,169 @@
+#!/bin/bash
+# tun.deps <check|install>
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+source ./tun.logger
+
+MODE=${1:-check}
+NS="tun-deps-$$"
+DEPS_FAILED=0
+DEPS_QUIET=0
+
+DEPS_COMMANDS=(
+    "ip:iproute2"
+    "tc:iproute2"
+    "iptables:iptables"
+    "conntrack:conntrack"
+    "ssh:openssh-client"
+    "ssh-keygen:openssh-client"
+    "sshpass:sshpass"
+    "ping:iputils-ping"
+    "timeout:coreutils"
+    "sha256sum:coreutils"
+    "seq:coreutils"
+    "realpath:coreutils"
+    "paste:coreutils"
+    "flock:util-linux"
+    "mountpoint:util-linux"
+    "ps:procps"
+    "pgrep:procps"
+    "pkill:procps"
+    "sysctl:procps"
+    "awk:gawk"
+    "find:findutils"
+    "systemctl:systemd"
+)
+
+deps_fail() {
+    DEPS_FAILED=1
+    [ "$DEPS_QUIET" = "1" ] || LOG ERROR "Dependency check: $*"
+}
+
+missing_packages() {
+    local entry cmd pkg
+    for entry in "${DEPS_COMMANDS[@]}"; do
+        IFS=':' read -r cmd pkg <<< "$entry"
+        command -v "$cmd" >/dev/null 2>&1 || echo "$pkg"
+    done | sort -u
+}
+
+apt_progress() {
+    local label=$1 line pct verb eta status
+    local eta_re='\(([^)]*remaining)\)'
+    local -a field
+    shift
+    if [ ! -t 1 ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get -qq "$@" > /dev/null 2>&1
+        return
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get -o APT::Status-Fd=3 "$@" 3>&1 > /dev/null 2>&1 | while IFS= read -r line; do
+        IFS=: read -ra field <<< "$line"
+        case "${field[0]:-}" in
+            dlstatus) verb=Downloading; pct=${field[2]:-} ;;
+            pmstatus) verb=Installing; pct=${field[2]:-}; [[ $pct =~ ^[0-9] ]] || pct=${field[3]:-} ;;
+            *) continue ;;
+        esac
+        [[ $pct =~ ^[0-9] ]] || continue
+        eta=""
+        [[ $line =~ $eta_re ]] && eta=" (${BASH_REMATCH[1]})"
+        printf '\r\033[K%s %s: %s%%%s' "$verb" "$label" "${pct%%.*}" "$eta"
+    done
+    status=${PIPESTATUS[0]}
+    printf '\r\033[K'
+    return "$status"
+}
+
+check_commands() {
+    local entry cmd pkg
+    for entry in "${DEPS_COMMANDS[@]}"; do
+        IFS=':' read -r cmd pkg <<< "$entry"
+        command -v "$cmd" >/dev/null 2>&1 || deps_fail "command ${cmd} not found (package ${pkg})"
+    done
+}
+
+probe() {
+    local what=$1 out
+    shift
+    if ! out=$(ip netns exec "$NS" "$@" 2>&1); then
+        deps_fail "${what} not available: ${out%%$'\n'*}"
+        return 1
+    fi
+}
+
+probe_kernel() {
+    probe "tun interface" ip tuntap add dev t0 mode tun || return
+    probe "tun interface" ip tuntap add dev t1 mode tun || return
+    ip netns exec "$NS" ip link set t0 up
+    ip netns exec "$NS" ip link set t1 up
+    ip netns exec "$NS" ip addr add 10.9.1.1/32 peer 10.9.1.2/32 dev t0
+    ip netns exec "$NS" ip addr add 10.9.2.1/32 peer 10.9.2.2/32 dev t1
+
+    probe "policy routing (ip rule)" ip rule add iif t0 table 300 priority 100
+    probe "multipath route (ECMP)" ip route replace default table 300 \
+        nexthop via 10.9.1.2 dev t0 weight 1 nexthop via 10.9.2.2 dev t1 weight 1
+    probe "iptables conntrack match" iptables -I FORWARD 1 -o t0 -m conntrack --ctstate NEW -j DROP
+    probe "iptables MASQUERADE" iptables -t nat -A POSTROUTING -s 10.0.0.0/8 ! -d 10.0.0.0/8 -o t0 -j MASQUERADE
+    probe "conntrack table access" conntrack -L
+
+    probe "tc tbf qdisc" tc qdisc add dev t0 root handle 1: tbf rate 1mbit burst 32kbit latency 50ms
+    probe "tc ingress qdisc" tc qdisc add dev t0 handle ffff: ingress || return
+    probe "ifb interface" ip link add ifb0 type ifb || return
+    ip netns exec "$NS" ip link set ifb0 up
+    probe "tc u32 filter with mirred action" tc filter add dev t0 parent ffff: protocol all \
+        u32 match u32 0 0 flowid 1:1 action mirred egress redirect dev ifb0
+}
+
+check_kernel() {
+    local out
+
+    [ -c /dev/net/tun ] || deps_fail "/dev/net/tun not found, ssh -w cannot create tunnels"
+
+    if ! out=$(ip netns add "$NS" 2>&1); then
+        deps_fail "cannot create a test network namespace, kernel features not checked: ${out}"
+        return
+    fi
+
+    probe_kernel
+    ip netns del "$NS" 2>/dev/null || true
+}
+
+trap 'ip netns del "$NS" 2>/dev/null || true' EXIT
+
+if [ "$MODE" = "install" ]; then
+    mapfile -t PACKAGES < <(missing_packages)
+    if [ ${#PACKAGES[@]} -gt 0 ]; then
+        LOG NOTICE "Installing missing packages: ${PACKAGES[*]}"
+        if ! { apt_progress "package lists" update && apt_progress "${PACKAGES[*]}" install -y "${PACKAGES[@]}"; }; then
+            LOG ERROR "Failed to install packages: ${PACKAGES[*]}"
+        fi
+    fi
+fi
+
+check_commands
+
+if [ "$DEPS_FAILED" -eq 0 ]; then
+    if [ "$MODE" = "install" ]; then
+        DEPS_QUIET=1
+        check_kernel
+        DEPS_QUIET=0
+
+        if [ "$DEPS_FAILED" -ne 0 ]; then
+            KERNEL_EXTRA="linux-modules-extra-$(uname -r)"
+            LOG NOTICE "Some kernel features are missing, trying to install ${KERNEL_EXTRA}"
+            apt_progress "$KERNEL_EXTRA" install -y "$KERNEL_EXTRA" || LOG WARN "Package ${KERNEL_EXTRA} could not be installed"
+            DEPS_FAILED=0
+        fi
+    fi
+
+    [ "$DEPS_FAILED" -eq 0 ] && check_kernel
+fi
+
+if [ "$DEPS_FAILED" -ne 0 ]; then
+    exit 1
+fi
+
+LOG NOTICE "Dependencies OK"
