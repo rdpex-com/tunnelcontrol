@@ -27,7 +27,9 @@ function loadSubscriptions() {
 
 function saveSubscriptions() {
     try {
-        fs.writeFileSync(SUBSCRIPTIONS_FILE, JSON.stringify(pushSubscriptions, null, 2));
+        const tmp = `${SUBSCRIPTIONS_FILE}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(pushSubscriptions, null, 2), { mode: 0o600 });
+        fs.renameSync(tmp, SUBSCRIPTIONS_FILE);
     } catch (e) {
         console.error('[Push] Failed to save subscriptions:', e.message);
     }
@@ -43,6 +45,10 @@ function generateVapidKeys() {
     }, null, 2), { mode: 0o600 });
 
     console.log('[VAPID] ✅ New keys generated and saved');
+    if (fs.existsSync(SUBSCRIPTIONS_FILE)) {
+        fs.rmSync(SUBSCRIPTIONS_FILE, { force: true });
+        console.log('[VAPID] Subscriptions made with the old keys removed, the devices subscribe again when they open the panel');
+    }
     return keys;
 }
 
@@ -60,19 +66,39 @@ function loadVapidKeys() {
     }
 }
 
-function pushEmail() {
+function readSetting(name) {
     let value = '';
     for (const file of ['tun.defaults', 'tun.config']) {
         try {
             const match = fs.readFileSync(path.join(ROOT_DIR, file), 'utf-8')
-                .match(/^[ \t]*WEB_PUSH_EMAIL=["']?([^"'\s#]*)/m);
+                .match(new RegExp(`^[ \\t]*${name}=["']?([^"'\\s#]*)`, 'm'));
             if (match) value = match[1];
         } catch {
             continue;
         }
     }
-    return value || 'root@localhost';
+    return value;
 }
+
+const PUSH_EMAIL = readSetting('WEB_PUSH_EMAIL') || 'root@localhost';
+const PUSH_ON = readSetting('WEB_PUSH') !== '0';
+const LOGOUT_UNSUBSCRIBE = readSetting('WEB_PUSH_LOGOUT_UNSUBSCRIBE') === '1';
+
+function pushEmail() {
+    return PUSH_EMAIL;
+}
+
+export function pushOn() {
+    return PUSH_ON;
+}
+
+function ensurePushReady() {
+    if (vapidKeys) return;
+    vapidKeys = loadVapidKeys();
+    loadSubscriptions();
+}
+
+const PUSH_OFF = { success: false, disabled: true, error: 'Push notifications are off (WEB_PUSH=0 in tun.config)' };
 
 async function sendNotification(subscription, body) {
     const payload = {
@@ -84,7 +110,7 @@ async function sendNotification(subscription, body) {
 
     try {
         await webpush.sendNotification(subscription, JSON.stringify(payload), {
-            TTL: 60,
+            TTL: 43200,
             urgency: 'normal',
             vapidDetails: {
                 subject: 'mailto:' + pushEmail(),
@@ -98,10 +124,12 @@ async function sendNotification(subscription, body) {
     } catch (error) {
         console.warn('[Push] Send failed:', subscription.endpoint, error.statusCode, error.message);
 
-        if (error.statusCode === 404 || error.statusCode === 410 || error.statusCode === 401) {
+        if (error.statusCode === 404 || error.statusCode === 410) {
             console.log('[Push] Removing dead subscription', subscription.endpoint);
             pushSubscriptions = pushSubscriptions.filter(sub => sub.endpoint !== subscription.endpoint);
             saveSubscriptions();
+        } else if (error.statusCode === 401) {
+            console.warn('[Push] The push service rejected the signature (401), the subscription is kept: check the server clock');
         }
 
         return false;
@@ -153,6 +181,12 @@ async function checkMessageQueue() {
 
         if (!content) return;
 
+        if (!pushOn()) {
+            console.log(`[Queue] Push notifications are off, dropped: ${oldestFile.name}`);
+            return;
+        }
+
+        ensurePushReady();
         console.log(`[Queue] Processing: ${oldestFile.name}`);
         await sendNotificationsToAll(content);
         messagesSentThisMinute++;
@@ -173,9 +207,11 @@ export function addToQueue(message) {
 }
 
 export function startPush() {
-    vapidKeys = loadVapidKeys();
-
-    loadSubscriptions();
+    if (pushOn()) {
+        ensurePushReady();
+    } else {
+        console.log('[Push] Push notifications are off (WEB_PUSH=0)');
+    }
 
     if (!fs.existsSync(QUEUE_DIR)) {
         fs.mkdirSync(QUEUE_DIR, { recursive: true });
@@ -186,13 +222,29 @@ export function startPush() {
 
 export default async function pushRoutes(app) {
     app.get('/api/push/vapid-public-key', async () => {
+        if (!pushOn()) return PUSH_OFF;
+        ensurePushReady();
         if (!vapidKeys || !vapidKeys.publicKey) {
             return { success: false, error: 'VAPID keys not available' };
         }
         return { success: true, publicKey: vapidKeys.publicKey };
     });
 
+    app.post('/api/push/unsubscribe', async (request) => {
+        const endpoint = request.body && request.body.endpoint;
+        if (!pushOn() || !LOGOUT_UNSUBSCRIBE || typeof endpoint !== 'string') {
+            return { success: true, unsubscribed: false };
+        }
+        ensurePushReady();
+        pushSubscriptions = pushSubscriptions.filter(sub => sub.endpoint !== endpoint);
+        saveSubscriptions();
+        console.log(`[Push] Subscription removed on Log Out. Total: ${pushSubscriptions.length}`);
+        return { success: true, unsubscribed: true };
+    });
+
     app.post('/api/push/subscribe', async (request) => {
+        if (!pushOn()) return PUSH_OFF;
+        ensurePushReady();
         try {
             const subscription = request.body;
             if (!subscription || !subscription.endpoint) {
@@ -208,11 +260,10 @@ export default async function pushRoutes(app) {
             console.log(`[Push] Subscription saved. Total: ${pushSubscriptions.length}`);
 
             if (!wasExisting) {
-                try {
-                    await sendNotification(subscription, "✅ Connection successful!\nYou will now receive important notifications about tunnel status.");
+                if (await sendNotification(subscription, "✅ Connection successful!\nYou will now receive important notifications about tunnel status.")) {
                     console.log('[Push] Welcome notification sent to new subscription');
-                } catch (e) {
-                    console.warn('[Push] Welcome notification failed:', e.message);
+                } else {
+                    console.warn('[Push] Welcome notification failed');
                 }
             } else {
                 console.log('[Push] Subscription updated (already existed)');

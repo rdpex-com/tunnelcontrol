@@ -9,6 +9,11 @@ fi
 source ./tun.logger
 source ./tun.env
 
+write_file() {
+    local tmp="${1%/*}/.${1##*/}.tmp"
+    printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$1"
+}
+
 TUN=${1}
 LOCAL_PEER=${2}
 REMOTE_PEER=${3}
@@ -17,7 +22,7 @@ TUNNEL_COUNT=${5}
 CONFIG=${6}
 
 if [ -z "$WEIGHT" ]; then
-    LOG INFO "[${TUN}] ERROR: Weight not specified for balance mode."
+    LOG ERROR "[${TUN}] Weight not specified for balance mode"
     exit 1
 fi
 
@@ -42,13 +47,13 @@ release_lock() {
     LOG INFO "[${TUN}] RELEASE LOCK ($PPID)"
 }
 
-trap 'release_lock' EXIT
-
 acquire_lock
+
+trap 'release_lock' EXIT
 
 LOG INFO "[${TUN}] Balance mode: Configuring tunnel to ${REMOTE_PEER} (weight ${WEIGHT})"
 
-echo "$WEIGHT" > "${DATA_PATH}/tun_weight_${TUN}"
+write_file "${DATA_PATH}/tun_weight_${TUN}" "$WEIGHT"
 LOG INFO "[${TUN}] Weight ${WEIGHT} saved for tunnel"
 
 iptables -t nat -D POSTROUTING -s "${NETWORK}" ! -d "${NETWORK}" -o "tun${TUN}" -j MASQUERADE 2>/dev/null || true
@@ -62,7 +67,6 @@ LOG INFO "[${TUN}] Outgoing traffic on tunnel allowed"
 iptables -D FORWARD -i "${IFACE}" -o "tun${TUN}" -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null || true
 iptables -A FORWARD -i "${IFACE}" -o "tun${TUN}" -m conntrack --ctstate NEW -j ACCEPT 2>/dev/null || true
 iptables -D FORWARD -i "tun${TUN}" -o "${IFACE}" -j ACCEPT 2>/dev/null || true
-iptables -A FORWARD -i "tun${TUN}" -o "${IFACE}" -j ACCEPT 2>/dev/null || true
 
 LIMIT="${SHAPING_RATE}"
 

@@ -19,11 +19,15 @@ ip rule del iif "${IFACE}" table 100 2>/dev/null || true
 ip rule del iif "${IFACE}" table 200 2>/dev/null || true
 ip rule del iif "${IFACE}" table 300 2>/dev/null || true
 
-ip rule del table 50 2>/dev/null || true
-ip rule del table 51 2>/dev/null || true
+while ip rule del priority 50 2>/dev/null; do :; done
+while ip rule del priority 51 2>/dev/null; do :; done
 ip rule del table 100 2>/dev/null || true
 ip rule del table 200 2>/dev/null || true
 ip rule del table 300 2>/dev/null || true
+
+while ip rule del priority 90 2>/dev/null; do :; done
+while ip rule del priority 91 2>/dev/null; do :; done
+while ip rule del priority 101 2>/dev/null; do :; done
 
 # Flush only our own routing tables
 ip route flush table 50 2>/dev/null || true
@@ -32,11 +36,15 @@ ip route flush table 51 2>/dev/null || true
 ip route flush table 100 2>/dev/null || true
 ip route flush table 200 2>/dev/null || true
 ip route flush table 300 2>/dev/null || true
+for id in $(ip nexthop show 2>/dev/null | awk '$1 == "id" && $2 >= 3000 && $2 < 4000 {print $2}' | sort -n); do
+    ip nexthop del id "$id" 2>/dev/null || true
+done
 
 # Exceptions (high priority)
 ip rule add from all to "${NETWORK}" table main priority 50 2>/dev/null || true
 # Traffic from clients on interface ${IFACE}
 ip rule add iif "${IFACE}" table 300 priority 100 2>/dev/null || true
+ip rule add iif "${IFACE}" priority 101 unreachable 2>/dev/null || true
 # All other outgoing traffic (from the server itself too)
 ip rule add from all table 300 priority 200 2>/dev/null || true
 
@@ -62,6 +70,11 @@ iptables -A OUTPUT -o lo -j ACCEPT
 
 iptables -A FORWARD -s 10.0.0.0/8 -d 10.0.0.0/8 -j DROP
 
+# === CLIENT TRAFFIC ONLY THROUGH TUNNELS ===
+# If all tunnels are down, client traffic must not go out directly
+# (FORWARD from clients back out of ${IFACE} is dropped when no tunnel is active)
+iptables -A FORWARD -i "${IFACE}" -o "${IFACE}" -j DROP
+
 # === ESTABLISHED, RELATED ===
 iptables -A INPUT   -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
 iptables -A OUTPUT  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -77,20 +90,15 @@ iptables -A OUTPUT -o "${IFACE}" -j ACCEPT
 iptables -A OUTPUT -o tun+ -m conntrack --ctstate NEW -j ACCEPT
 
 # === Client access to local services on B ===
-iptables -A INPUT  -s "${NETWORK}" -j ACCEPT
+iptables -A INPUT  -i "${IFACE}" -s "${NETWORK}" -j ACCEPT
 iptables -A OUTPUT -d "${NETWORK}" -j ACCEPT
 
 # === ICMP ===
 iptables -A INPUT  -p icmp -j ACCEPT
 iptables -A OUTPUT -p icmp -j ACCEPT
-iptables -A FORWARD -p icmp -j ACCEPT
+iptables -A FORWARD -i "${IFACE}" -o tun+ -p icmp -j ACCEPT
 
 # === TCP MSS clamping (global for all tunnels) ===
 iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
-
-# === CLIENT TRAFFIC ONLY THROUGH TUNNELS ===
-# If all tunnels are down, client traffic must not go out directly
-# (FORWARD from clients back out of ${IFACE} is dropped when no tunnel is active)
-iptables -A FORWARD -i "${IFACE}" -o "${IFACE}" -j DROP
 
 LOG INFO "GLOBAL rules applied successfully"

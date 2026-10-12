@@ -10,7 +10,7 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 
 HOST=${1:-}
 
-mapfile -t HOSTS < <(sed -n 's/^[[:space:]]*"\([^":[:space:]]*\):.*/\1/p' ./tun.config | awk '!seen[$0]++')
+mapfile -t HOSTS < <(sed -nE 's/^[[:space:]]*["\x27]?([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+):.*/\1/p' ./tun.config | awk '!seen[$0]++')
 
 host_enabled() {
     [ -f "${DATA_PATH}/tun_host_$1_enabled" ] || [ ! -f "${DATA_PATH}/tun_host_$1_disabled" ]
@@ -25,7 +25,17 @@ active_enabled_hosts() {
         [ -n "$host" ] || continue
         [ -f "${DATA_PATH}/tun_host_${host}_disabled" ] && continue
         grep -q '^ONLINE' "$state_file" && echo "$host"
-    done | sort -u | wc -l
+    done | sort -u
+}
+
+other_enabled_hosts() {
+    local entry
+    for entry in "${HOSTS[@]}"; do
+        [ "$entry" = "$HOST" ] && continue
+        [ -f "${DATA_PATH}/tun_host_${entry}_held" ] && continue
+        [ -f "${DATA_PATH}/tun_host_${entry}_loaded" ] || continue
+        host_enabled "$entry" && echo "$entry"
+    done | wc -l
 }
 
 if [ -z "$HOST" ]; then
@@ -46,13 +56,23 @@ if ! printf '%s\n' "${HOSTS[@]}" | grep -qxF -- "$HOST"; then
 fi
 
 PID=$(cat "${DATA_PATH}/tun_pid" 2>/dev/null)
-if ! [[ $PID =~ ^[0-9]+$ ]] || ! kill -0 "$PID" 2>/dev/null; then
+if ! [[ $PID =~ ^[0-9]+$ ]] || ! tr '\0' '\n' 2>/dev/null < "/proc/${PID}/cmdline" | grep -qx './tun.manager'; then
     echo "The tunnels are not running"
     exit 1
 fi
 
 if host_enabled "$HOST"; then
-    if [ "$(active_enabled_hosts)" -le 1 ]; then
+    mapfile -t ACTIVE < <(active_enabled_hosts)
+    TARGET_ACTIVE=0
+    OTHER_ACTIVE=0
+    for ENTRY in "${ACTIVE[@]}"; do
+        if [ "$ENTRY" = "$HOST" ]; then
+            TARGET_ACTIVE=1
+        else
+            OTHER_ACTIVE=$((OTHER_ACTIVE + 1))
+        fi
+    done
+    if [ "$(other_enabled_hosts)" -eq 0 ] || { [ "$TARGET_ACTIVE" -eq 1 ] && [ "$OTHER_ACTIVE" -eq 0 ]; }; then
         echo "Cannot disable the last active host. At least one host must remain enabled."
         exit 1
     fi

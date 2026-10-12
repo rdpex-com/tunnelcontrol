@@ -1,5 +1,5 @@
 #!/bin/bash
-# tun.post.balance.routing <mode> <tun> <config> <mode>
+# tun.post.balance.routing <mode> <tun> <tunnel_count> <config> <drop_new>
 
 if [ -z "${DATA_PATH}" ]; then
     echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
@@ -54,6 +54,9 @@ else
 fi
 
 ACTIVE_NEXTHOPS=""
+SLOTS=()
+NEXTHOP_BASE=3000
+ROUTE_MODE=$(cat "${DATA_PATH}/tun_routing_mode" 2>/dev/null || echo route)
 
 declare -A HOST_CONFIGURED
 declare -A HOST_LIVE
@@ -108,33 +111,46 @@ for HOST in "${!HOST_CONFIGURED[@]}"; do
         continue
     fi
 
-    FINAL_LIST=()
-
     for entry in "${CONFIG_LIST[@]}"; do
         IFS=':' read -r t STATUS REMOTE WEIGHT <<< "$entry"
 
         if [ "$STATUS" = "LIVE" ]; then
-            FINAL_LIST+=("nexthop via ${REMOTE} dev tun${t} weight ${WEIGHT}")
+            SLOTS+=("${t}:${REMOTE}:${t}:${WEIGHT}")
         else
             # Gap: take a random live tunnel of this host
             rand_idx=$(( RANDOM % ${#LIVE_LIST[@]} ))
             IFS=':' read -r lt lremote lweight <<< "${LIVE_LIST[$rand_idx]}"
-            FINAL_LIST+=("nexthop via ${lremote} dev tun${lt} weight ${lweight}")
+            WEIGHT=$(cat "${DATA_PATH}/tun_weight_${t}" 2>/dev/null || echo "$lweight")
+            SLOTS+=("${t}:${lremote}:${lt}:${WEIGHT}")
         fi
-    done
-
-    for item in "${FINAL_LIST[@]}"; do
-        ACTIVE_NEXTHOPS="${ACTIVE_NEXTHOPS} ${item}"
     done
 done
 
-if [ -n "$ACTIVE_NEXTHOPS" ]; then
+if [ ${#SLOTS[@]} -eq 0 ]; then
+    LOG INFO "[${TUN}] Multipath route empty"
+elif [ "$ROUTE_MODE" = "group" ]; then
+    GROUP=""
+    for slot in "${SLOTS[@]}"; do
+        IFS=':' read -r t remote dev weight <<< "$slot"
+        ip nexthop replace id $((NEXTHOP_BASE + t)) via "${remote}" dev "tun${dev}" 2>/dev/null || continue
+        GROUP="${GROUP}/$((NEXTHOP_BASE + t)),${weight}"
+        ACTIVE_NEXTHOPS="${ACTIVE_NEXTHOPS} ${t}:tun${dev}:${weight}"
+    done
+    if [ -n "$GROUP" ]; then
+        ip nexthop replace id "${NEXTHOP_BASE}" group "${GROUP#/}" type resilient buckets 512 idle_timer 60 2>/dev/null || true
+        ip route replace default table 300 nhid "${NEXTHOP_BASE}" 2>/dev/null || true
+        ip rule add iif "${IFACE}" table 300 priority 100 2>/dev/null || true
+    fi
+    LOG INFO "[${TUN}] Nexthop group updated (slot:tunnel:weight):${ACTIVE_NEXTHOPS}"
+else
+    for slot in "${SLOTS[@]}"; do
+        IFS=':' read -r t remote dev weight <<< "$slot"
+        ACTIVE_NEXTHOPS="${ACTIVE_NEXTHOPS} nexthop via ${remote} dev tun${dev} weight ${weight}"
+    done
     read -ra NEXTHOP_ARGS <<< "$ACTIVE_NEXTHOPS"
     ip route replace default table 300 "${NEXTHOP_ARGS[@]}" 2>/dev/null || true
     ip rule add iif "${IFACE}" table 300 priority 100 2>/dev/null || true
     LOG INFO "[${TUN}] Multipath route updated: ${ACTIVE_NEXTHOPS}"
-else
-    LOG INFO "[${TUN}] Multipath route empty"
 fi
 
 ip neigh flush dev "tun${TUN}" 2>/dev/null || true

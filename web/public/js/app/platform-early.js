@@ -33,4 +33,19 @@
     }
 
     setTimeout(() => html.classList.add('layout-ready'), 3000);
+
+    document.addEventListener('DOMContentLoaded', () => {
+        if (!html.classList.contains('mobile')) return;
+        const header = document.getElementById('header-container');
+        if (header) {
+            header.classList.remove('items-center', 'pb-6');
+            header.classList.add('flex-col', 'items-start', 'pb-2');
+        }
+        document.getElementById('title-wrapper')?.classList.add('mb-4');
+        document.getElementById('status-container')?.classList.add('self-end', 'mt-[4px]');
+        const tabs = document.getElementById('tabs');
+        if (tabs) tabs.style.display = 'none';
+        document.getElementById('content-container')?.classList.add('pwa-mode');
+        document.getElementById('bottom-nav')?.classList.remove('hidden');
+    });
 })();

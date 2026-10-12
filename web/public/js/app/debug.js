@@ -3,7 +3,8 @@ export let DEBUG_MODE = false;
 export let LOG_MODULE = [
     'app',
     //'sw',
-    //'notifications'
+    'notifications',
+    '*'
 ];
 
 let autoScroll = true;
@@ -45,14 +46,26 @@ function ensureDebugPanel() {
     panel.innerHTML = `
         <div class="flex justify-between items-center mb-2">
             <strong>Debug Info:</strong>
-            <button type="button"
-                    class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
-                Clear
-            </button>
+            <div class="flex gap-2">
+                <button type="button" data-debug="copy"
+                        class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
+                    Copy
+                </button>
+                <button type="button" data-debug="clear"
+                        class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
+                    Clear
+                </button>
+                <button type="button" data-debug="off"
+                        class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
+                    Hide
+                </button>
+            </div>
         </div>
         <pre id="debug-content" class="font-mono text-xs whitespace-pre-wrap max-h-96 overflow-auto"></pre>
     `;
-    panel.querySelector('button').addEventListener('click', clearDebug);
+    panel.querySelector('[data-debug="clear"]').addEventListener('click', clearDebug);
+    panel.querySelector('[data-debug="off"]').addEventListener('click', disableDebug);
+    panel.querySelector('[data-debug="copy"]').addEventListener('click', (event) => copyDebug(event.currentTarget));
     document.body.appendChild(panel);
     initDebugScroll();
     return panel;
@@ -77,8 +90,8 @@ export function logDebug(message, ...args) {
 
     // Filtering by module (if configured)
     if (LOG_MODULE && Array.isArray(LOG_MODULE) && LOG_MODULE.length > 0) {
-        const regex = new RegExp(`^\\[(?:${modules})\\]`, 'i');
-        if (!regex.test(message)) {
+        const tag = /^\[([^\]]+)\]/.exec(message);
+        if (tag ? !LOG_MODULE.some(m => m.toLowerCase() === tag[1].toLowerCase()) : !LOG_MODULE.includes('*')) {
             return;
         }
     }
@@ -129,6 +142,44 @@ export function logDebug(message, ...args) {
     if (autoScroll) {
         content.scrollTop = content.scrollHeight;
     }
+}
+
+export async function copyDebug(button) {
+    const text = document.getElementById('debug-content')?.textContent || '';
+    let copied = false;
+    try {
+        await navigator.clipboard.writeText(text);
+        copied = true;
+    } catch {
+        const area = document.createElement('textarea');
+        area.value = text;
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        try {
+            copied = document.execCommand('copy');
+        } catch {
+            copied = false;
+        }
+        area.remove();
+    }
+    if (button) {
+        const label = button.textContent;
+        button.textContent = copied ? 'Copied' : 'Copy failed';
+        setTimeout(() => { button.textContent = label; }, 1500);
+    }
+}
+
+export function disableDebug() {
+    try {
+        localStorage.removeItem('debugMode');
+    } catch {
+        DEBUG_MODE = false;
+    }
+    const url = new URL(window.location.href);
+    url.searchParams.delete('debug');
+    window.location.replace(url.toString());
 }
 
 export function clearDebug() {

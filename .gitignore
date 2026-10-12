@@ -1,5 +1,5 @@
 tun.config
-tun.server.setup.*
+tun.server.setup.[0-9]*
 data/
 bak/
 .data_path

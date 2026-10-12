@@ -1,8 +1,10 @@
 #!/bin/bash
 # tun.server <tun> <in_face> <port_ssh> <port_range> <public_ip> <out_face> <local_ip> <remote_ip> <mtu>
 
+RUN_DIR="/run/tunnelcontrol"
+
 if [ "$(basename "$0")" != "tun.start" ]; then
-    echo "Error: this script runs on the VPS as /tmp/tun.start. Do not run this script directly."
+    echo "Error: this script runs on the VPS as ${RUN_DIR}/tun.start. Do not run this script directly."
     exit 1
 fi
 
@@ -17,6 +19,7 @@ REMOTE_IP=${8}
 MTU=${9:-1400}
 
 LOG="/var/log/tun.log"
+LOG_MAX_KB=1024
 
 LOG_INFO() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [tun${TUN}] $1" >> "$LOG"
@@ -41,35 +44,78 @@ cleanup() {
     fi
 }
 
-vps_check() {
-    local c pt sshd_bin
+vps_interfaces() {
+    local dev name list=""
+    for dev in /sys/class/net/*; do
+        name=${dev##*/}
+        [[ $name =~ ^(lo|tun[0-9]+|ifb[0-9]+)$ ]] || list="${list} ${name}"
+    done
+    echo "${list# }"
+}
 
-    for c in ip iptables sysctl pgrep systemd-run; do
+vps_check() {
+    local c pt sshd_bin dev check_dev="tunchk$$"
+
+    for c in ip iptables sysctl; do
+        command -v "$c" > /dev/null 2>&1 || echo "VPS-FATAL: command ${c} not found"
+    done
+
+    for c in pgrep systemd-run; do
         command -v "$c" > /dev/null 2>&1 || echo "VPS-PROBLEM: command ${c} not found"
     done
 
+    for dev in $(ip -o link show 2>/dev/null | awk -F': ' '$2 ~ /^tunchk[0-9]+$/ {print $2}'); do
+        kill -0 "${dev#tunchk}" 2>/dev/null || ip tuntap del dev "$dev" mode tun > /dev/null 2>&1
+    done
+
     if [ ! -c /dev/net/tun ]; then
-        echo "VPS-PROBLEM: /dev/net/tun not found, tunnels cannot be created (on OpenVZ/LXC enable TUN/TAP in the hosting panel)"
-    elif ! ip tuntap add dev tuncheck mode tun > /dev/null 2>&1; then
-        echo "VPS-PROBLEM: cannot create a tun interface (tun kernel module missing or not permitted)"
+        echo "VPS-FATAL: /dev/net/tun not found, tunnels cannot be created (on OpenVZ/LXC enable TUN/TAP in the hosting panel)"
+    elif ! ip tuntap add dev "$check_dev" mode tun > /dev/null 2>&1; then
+        echo "VPS-FATAL: cannot create a tun interface (tun kernel module missing or not permitted)"
     else
-        ip tuntap del dev tuncheck mode tun > /dev/null 2>&1
+        ip tuntap del dev "$check_dev" mode tun > /dev/null 2>&1
     fi
 
     sshd_bin=$(command -v sshd || echo /usr/sbin/sshd)
     pt=$("$sshd_bin" -T 2>/dev/null | awk '$1 == "permittunnel" {print $2}')
     case "$pt" in
         yes|point-to-point|all) ;;
-        *) echo "VPS-PROBLEM: sshd PermitTunnel is '${pt:-unknown}', tunnel requests are refused" ;;
+        *) echo "VPS-FATAL: sshd PermitTunnel is '${pt:-unknown}', tunnel requests are refused" ;;
     esac
 
     if [ "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)" != "1" ]; then
-        echo "VPS-PROBLEM: net.ipv4.ip_forward is not 1, traffic from tunnels is not forwarded"
+        echo "VPS-FATAL: net.ipv4.ip_forward is not 1, traffic from tunnels is not forwarded"
+    fi
+
+    if [ -n "${IN_FACE}" ] && ! ip link show "${IN_FACE}" > /dev/null 2>&1; then
+        echo "VPS-FATAL: interface ${IN_FACE} (IN_IFACE in TUNNELS) not found; the interfaces of the VPS: $(vps_interfaces)"
+    fi
+    if [ -n "${PUBLIC_IP}" ] && [ "${PUBLIC_IP}" != "NA" ] && [ -n "${OUT_FACE}" ] && [ "${OUT_FACE}" != "NA" ] \
+        && ! ip link show "${OUT_FACE}" > /dev/null 2>&1; then
+        echo "VPS-FATAL: interface ${OUT_FACE} (OUT_IFACE in TUNNELS) not found; the interfaces of the VPS: $(vps_interfaces)"
     fi
 }
 
 if [ "${TUN_CHECK:-0}" = "1" ]; then
     vps_check
+    exit 0
+fi
+
+if [ "${TUN_FREE:-0}" = "1" ]; then
+    for fd in /proc/[0-9]*/fd/*; do
+        [ "$(readlink "$fd" 2>/dev/null)" = /dev/net/tun ] || continue
+        pid=${fd#/proc/}
+        pid=${pid%%/*}
+        [ "$pid" = "$PPID" ] && continue
+        [ "$(awk '$1 == "iff:" { print $2 }' "/proc/${pid}/fdinfo/${fd##*/}" 2>/dev/null)" = "tun${TUN}" ] || continue
+        name=$(cat "/proc/${pid}/comm" 2>/dev/null)
+        if [ "$name" != "sshd" ]; then
+            echo "VPS-PROBLEM: tun${TUN} is held by process ${pid} (${name:-unknown}), not by an SSH session"
+            continue
+        fi
+        LOG_INFO "Killing sshd ${pid} of an old session that still holds tun${TUN}"
+        kill -9 "$pid" 2>/dev/null && echo "VPS-FREED: ${pid}"
+    done
     exit 0
 fi
 
@@ -88,19 +134,28 @@ if [ "${TUN_WATCH:-0}" = "1" ]; then
     exit 0
 fi
 
+if [ "${TUN}" -eq 0 ] && [ "${LOG_MAX_KB}" -gt 0 ] && [ -f "$LOG" ] && [ "$(stat -c %s "$LOG")" -gt $((LOG_MAX_KB * 1024)) ]; then
+    tail -c $((LOG_MAX_KB * 512)) "$LOG" | tail -n +2 > "${LOG}.trim" && cat "${LOG}.trim" > "$LOG"
+    rm -f "${LOG}.trim"
+    LOG_INFO "Log trimmed to its last $((LOG_MAX_KB / 2)) KB (LOG_VPS_MAX_KB=${LOG_MAX_KB})"
+fi
+
 if [ "${TUN}" -eq 0 ]; then
     LOG_INFO "Started with params: in_face=${IN_FACE} ssh=${PORT_SSH} range=${PORT_RANGE} public_ip=${PUBLIC_IP} out_face=${OUT_FACE}"
 else
     LOG_INFO "Started with params: tun=${TUN} in_face=${IN_FACE} public_ip=${PUBLIC_IP} out_face=${OUT_FACE} local=${LOCAL_IP} remote=${REMOTE_IP}"
 fi
 
-GLOBAL_FLAG="/tmp/tun_initialized"
+GLOBAL_FLAG="${RUN_DIR}/initialized"
 
 # ====================== GLOBAL INITIALIZATION ======================
 if [ ! -f "$GLOBAL_FLAG" ]; then
     LOG_INFO "First run - performing global initialization"
 
-    sysctl -w net.ipv4.ip_forward=1 >/dev/null
+    sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1 || true
+    sysctl -w net.ipv6.conf.lo.disable_ipv6=1 >/dev/null 2>&1 || true
 
     # Kill old instances
     for pid in $(pgrep -f "tun.start" 2>/dev/null); do
@@ -127,9 +182,12 @@ if [ ! -f "$GLOBAL_FLAG" ]; then
         LOG_INFO "Configuring Public IP: $PUBLIC_IP on $OUT_FACE"
 
         # Add the public IP to the interface
-        if ! ip addr show dev "$OUT_FACE" | grep -q "$PUBLIC_IP"; then
-            ip addr add "$PUBLIC_IP"/32 dev "$OUT_FACE"
-            LOG_INFO "Public IP $PUBLIC_IP added to $OUT_FACE"
+        if ! ip -4 -o addr show dev "$OUT_FACE" | awk '{print $4}' | cut -d/ -f1 | grep -qxF "$PUBLIC_IP"; then
+            if ip addr add "$PUBLIC_IP"/32 dev "$OUT_FACE"; then
+                LOG_INFO "Public IP $PUBLIC_IP added to $OUT_FACE"
+            else
+                PUBLIC_IP_PROBLEM="public IP ${PUBLIC_IP} could not be added to ${OUT_FACE}"
+            fi
         else
             LOG_INFO "Public IP $PUBLIC_IP already exists on $OUT_FACE"
         fi
@@ -138,9 +196,15 @@ if [ ! -f "$GLOBAL_FLAG" ]; then
         while ip rule del lookup $TABLE 2>/dev/null; do :; done
         ip route flush table "$TABLE" 2>/dev/null || true
 
-        DEFAULT_GW=$(ip route show default | awk '{print $3}' | head -n1)
+        DEFAULT_GW=$(ip route show default | awk '{for (i = 1; i < NF; i++) if ($i == "via") {print $(i + 1); exit}}')
 
-        ip route add default via "$DEFAULT_GW" dev "$OUT_FACE" table "$TABLE"
+        if [ -n "$DEFAULT_GW" ]; then
+            ip route add default via "$DEFAULT_GW" dev "$OUT_FACE" table "$TABLE" \
+                || PUBLIC_IP_PROBLEM="route via ${DEFAULT_GW} dev ${OUT_FACE} for the public IP could not be added"
+        else
+            ip route add default dev "$OUT_FACE" table "$TABLE" \
+                || PUBLIC_IP_PROBLEM="route dev ${OUT_FACE} for the public IP could not be added"
+        fi
         ip route add "$PUBLIC_IP"/32 dev "$OUT_FACE" table "$TABLE"
 
         # SNAT through OUT_FACE
@@ -178,19 +242,29 @@ if [ ! -f "$GLOBAL_FLAG" ]; then
 
     iptables -A INPUT -p tcp -m multiport --dports "${MIN}:${MAX}" -j DROP
 
-    iptables -S INPUT 2>/dev/null | grep -q -- '--ctstate' \
-        || echo "VPS-PROBLEM: conntrack rule was not added, replies to the VPS are dropped"
-    iptables -t nat -S POSTROUTING 2>/dev/null | grep -qE -- '-j (SNAT|MASQUERADE)' \
-        || echo "VPS-PROBLEM: NAT rule was not added, traffic from tunnels does not reach the internet"
-    iptables -S INPUT 2>/dev/null | grep -q -- '--dports' \
-        || echo "VPS-PROBLEM: multiport DROP rule was not added, the port range stays open for everyone"
-    if [ -n "${INITIATOR}" ]; then
-        iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '-j REDIRECT' \
-            || echo "VPS-PROBLEM: REDIRECT rule was not added, tunnels on random ports cannot connect"
+    REPORT=$(
+        iptables -S INPUT 2>/dev/null | grep -q -- '--ctstate' \
+            || echo "VPS-PROBLEM: conntrack rule was not added, replies to the VPS are dropped"
+        iptables -t nat -S POSTROUTING 2>/dev/null | grep -qE -- '-j (SNAT|MASQUERADE)' \
+            || echo "VPS-FATAL: NAT rule was not added, traffic from tunnels does not reach the internet"
+        iptables -S INPUT 2>/dev/null | grep -q -- '--dports' \
+            || echo "VPS-PROBLEM: multiport DROP rule was not added; the port range is still closed by the INPUT policy"
+        if [ -n "${INITIATOR}" ]; then
+            iptables -t nat -S PREROUTING 2>/dev/null | grep -q -- '-j REDIRECT' \
+                || echo "VPS-FATAL: REDIRECT rule was not added, tunnels on random ports cannot connect"
+        fi
+        vps_check
+        [ -n "${PUBLIC_IP_PROBLEM}" ] && echo "VPS-FATAL: ${PUBLIC_IP_PROBLEM}"
+    )
+    [ -n "$REPORT" ] && echo "$REPORT"
+
+    if grep -q '^VPS-FATAL: ' <<< "$REPORT"; then
+        LOG_INFO "Global initialization failed: the VPS lacks what tunnels need"
+        echo "Unusable"
+        exit
     fi
 
-    vps_check
-
+    mkdir -p "${RUN_DIR}"
     touch "$GLOBAL_FLAG"
 
     LOG_INFO "Global initialization completed"

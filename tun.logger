@@ -19,35 +19,33 @@ LOG() {
     shift
     local message="$*"
     local threshold=${LOG_LEVEL:-1}
-    local tag=$level
     local line
 
     [[ $threshold =~ ^[0-9]+$ ]] || threshold=1
-    [ "$level" = "NOTICE" ] && tag=INFO
-    line="[$(date '+%Y-%m-%d %H:%M:%S')] [${CALLER_NAME}][${tag}] ${message}"
+    line="[$(date '+%Y-%m-%d %H:%M:%S')] [${CALLER_NAME}][${level}] ${message}"
 
     case "$level" in
         ERROR)
-            echo "$line" | tee -a "$LOGFILE" >&2
+            echo "$line" | tee -a "$LOGFILE" >&2 || true
             ;;
         WARN)
-            echo "$line" | tee -a "$LOGFILE"
+            echo "$line" | tee -a "$LOGFILE" || true
             ;;
         INFO)
             [ "$threshold" -ge 2 ] || return 0
-            echo "$line"
+            echo "$line" 2>/dev/null || true
             ;;
         DEBUG)
             [ "$threshold" -ge 3 ] || return 0
             ;;
         *)
             [ "$threshold" -ge 1 ] || return 0
-            echo "$line" | tee -a "$LOGFILE"
+            echo "$line" | tee -a "$LOGFILE" || true
             ;;
     esac
 
     if [ "$threshold" -ge 2 ]; then
-        echo "$line" >> "$VERBOSE_LOG"
+        echo "$line" 2>/dev/null >> "$VERBOSE_LOG" || true
     fi
     return 0
 }

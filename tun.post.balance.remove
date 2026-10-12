@@ -1,5 +1,5 @@
 #!/bin/bash
-# tun.post.balance.remove <mode> <tun> [remote_peer] [tunnel_count] [config]
+# tun.post.balance.remove <tun> <remote_peer> <tunnel_count> <config>
 
 if [ -z "${DATA_PATH}" ]; then
     echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
@@ -33,9 +33,9 @@ release_lock() {
     LOG INFO "[${TUN}] RELEASE LOCK ($PPID)"
 }
 
-trap 'release_lock' EXIT
-
 acquire_lock
+
+trap 'release_lock' EXIT
 
 LOG INFO "[${TUN}] Balance mode: Full removing..."
 
@@ -55,6 +55,7 @@ conntrack -D --reply-src "$REMOTE_PEER" 2>/dev/null || true
 conntrack -D --reply-dst "$REMOTE_PEER" 2>/dev/null || true
 conntrack -D --orig-dst "$REMOTE_PEER" 2>/dev/null || true
 conntrack -D --orig-src "$REMOTE_PEER" 2>/dev/null || true
+conntrack -D --reply-dst "10.${TUN}.${TUN}.1" 2>/dev/null || true
 
 touch "${DATA_PATH}/tun_removed_${TUN}" 
 

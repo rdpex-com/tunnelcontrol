@@ -13,7 +13,7 @@ export async function updateServiceStatus(timeout = 1000) {
         const data = await res.json();
         if (!data.success) return;
 
-        updateTopServiceStatus(data.isActive);
+        updateTopServiceStatus(data.isRunning);
 
         if (window.currentTab === 3) {
             const btnStart = document.getElementById('btn-start');
@@ -68,15 +68,10 @@ export async function controlService(action) {
 
         if (data.success) {
             updateServiceStatus();
-            setTimeout(() => { if (typeof loadStatus === 'function') loadStatus(); }, 1500);
         } else {
             window.showToast(`✗ ${data.error || 'Unknown error'}`, 'error');
         }
     } catch (e) {
         window.showToast("Failed to send command", 'error');
     }
-}
-
-export function refreshAll() {
-    if (typeof loadStatus === 'function') loadStatus();
 }

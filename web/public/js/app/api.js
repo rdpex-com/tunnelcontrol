@@ -1,6 +1,16 @@
 import { logDebug } from './debug.js';
 import { Platform } from './platform.js';
 
+function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function configNotLoaded(reason) {
+    const editor = document.getElementById('config-editor');
+    if (editor) editor.value = `Config not loaded: ${reason}. Reload the page to try again.`;
+    window.showToast('Config not loaded', 'error');
+}
+
 export async function loadConfig() {
     try {
         const res = await fetch('/api/config');
@@ -11,9 +21,12 @@ export async function loadConfig() {
                 editor.value = data.content;
                 window.configLoaded = true;
             }
+        } else {
+            configNotLoaded(data.error || 'the server refused');
         }
     } catch (e) {
         logDebug('loadConfig error', e.message);
+        configNotLoaded(e.message);
     }
 }
 
@@ -42,10 +55,17 @@ export async function saveConfig() {
         const data = await res.json();
 
         if (data.success) {
+            window.showConfigErrors(content, []);
             window.originalConfig = editor.value;
             window.showButtonSave(editor);
-            window.showToast("Configuration saved successfully");
+            window.showToast("Configuration saved, restart the tunnels to apply it");
             return true;
+        }
+        if (Array.isArray(data.errors) && data.errors.length) {
+            window.showConfigErrors(content, data.errors);
+            const count = data.errors.length;
+            window.showToast(`Config not saved: ${count} error${count === 1 ? '' : 's'}`, 'error');
+            return false;
         }
         window.showToast("Error: " + (data.error || 'Unknown error'), 'error');
         return false;
@@ -135,8 +155,8 @@ export async function updateSysInfo(timeout = 10000) {
                 const [key, value] = item.split(':').map(s => s.trim());
                 if (key && value) {
                     html += `
-                        <div class="text-gray-500 dark:text-gray-400">${key}:</div>
-                        <div class="font-mono text-right text-gray-900 dark:text-gray-100">${value}</div>
+                        <div class="text-gray-500 dark:text-gray-400">${escapeHtml(key)}:</div>
+                        <div class="font-mono text-right text-gray-900 dark:text-gray-100">${escapeHtml(value)}</div>
                     `;
                 }
             });
@@ -148,8 +168,8 @@ export async function updateSysInfo(timeout = 10000) {
                 const [key, value] = item.split(':').map(s => s.trim());
                 if (key && value) {
                     html += `
-                        <span class="text-gray-500 dark:text-gray-400">${key}: </span>
-                        <span class="font-mono text-gray-900 dark:text-gray-100">${value}</span>
+                        <span class="text-gray-500 dark:text-gray-400">${escapeHtml(key)}: </span>
+                        <span class="font-mono text-gray-900 dark:text-gray-100">${escapeHtml(value)}</span>
                     `;
                 }
             });

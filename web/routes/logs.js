@@ -8,7 +8,9 @@ const LOG_FILES = {
     main: '/var/log/tun.log',
     verbose: '/var/log/tun.verbose.log',
     mon_total: '/var/log/tun.mon.total.log',
-    mon_verbose: '/var/log/tun.mon.verbose.log'
+    mon_verbose: '/var/log/tun.mon.verbose.log',
+    mon_debug: '/var/log/tun.mon.debug.log',
+    mon_errors: '/var/log/tun.mon.errors.log'
 };
 
 const LOG_DIR = '/var/log';
@@ -16,7 +18,7 @@ const LOG_DIR = '/var/log';
 const LOG_MIN_LEVEL = {
     'tun.verbose.log': 2,
     'tun.mon.total.log': 2,
-    'tun.mon.verbose.log': 2,
+    'tun.mon.verbose.log': 3,
     'tun.mon.debug.log': 3
 };
 
@@ -34,12 +36,14 @@ function logLevel() {
     return Number(value);
 }
 
+const LOG_LEVEL = logLevel();
+
 function formatSize(bytes) {
     return bytes >= 1048576 ? `${(bytes / 1048576).toFixed(1)} MB` : `${Math.ceil(bytes / 1024)} KB`;
 }
 
 function leftoverNotice() {
-    const level = logLevel();
+    const level = LOG_LEVEL;
     const bases = Object.keys(LOG_MIN_LEVEL).filter(base => LOG_MIN_LEVEL[base] > level);
     let total = 0;
     try {
@@ -62,7 +66,7 @@ export default async function logsRoutes(app) {
 
     app.get('/api/logs', async (request) => {
         const logType = request.query.type || 'main';
-        const lines = parseInt(request.query.lines) || 100;
+        const lines = Math.min(Math.max(parseInt(request.query.lines) || 100, 1), 1000);
         const filePath = LOG_FILES[logType] || LOG_FILES.main;
 
         try {

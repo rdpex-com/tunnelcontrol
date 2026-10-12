@@ -36,7 +36,20 @@ TRAFFIC_DRAIN_THRESHOLD=${ROTATION_DRAIN_THRESHOLD}
 ON_DRAIN_TIMEOUT="${ROTATION_ON_DRAIN_TIMEOUT}"
 # =======================================================
 
+write_file() {
+    local tmp="${1%/*}/.${1##*/}.tmp"
+    printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$1"
+}
+
 STOP_FILE="${DATA_PATH}/tun_stop"
+
+if [ ! -f "${STOP_FILE}" ]; then
+    for stale in "${DATA_PATH}"/tun_stop_[0-9]*; do
+        [ -f "$stale" ] || continue
+        LOG INFO "Removing ${stale##*/} left by a previous scheduler, the channel reconnects"
+        rm -f "$stale"
+    done
+fi
 
 declare -A TUN_TO_HOST
 declare -A UNIQUE_HOSTS
@@ -103,7 +116,8 @@ should_skip_rotation() {
     local result
 
     for host in "${!UNIQUE_HOSTS[@]}"; do
-        if [ -f "${DATA_PATH}/tun_host_${host}_disabled" ] || [ -f "${DATA_PATH}/tun_host_${host}_busy" ]; then
+        if [ -f "${DATA_PATH}/tun_host_${host}_disabled" ] || [ -f "${DATA_PATH}/tun_host_${host}_held" ] \
+            || [ ! -f "${DATA_PATH}/tun_host_${host}_loaded" ]; then
             disabled_hosts=$((disabled_hosts + 1))
         else
             active_hosts=$((active_hosts + 1))
@@ -113,6 +127,7 @@ should_skip_rotation() {
     if [ "${ACTIVE_HOSTS_ONLY:-0}" -eq 1 ]; then
         if [ "$active_hosts" -lt "$MIN_UNIQUE_HOSTS" ]; then
             result=1
+            SKIP_REASON="only ${active_hosts} enabled host(s), ROTATION_MIN_UNIQUE_HOSTS=${MIN_UNIQUE_HOSTS}"
         else
             result=0
         fi
@@ -132,7 +147,7 @@ should_skip_rotation() {
     return 255                  # ACTIVE_HOSTS_ONLY is off, no effect
 }
 
-wait() {
+wait_watching() {
     local seconds=$1
     local tun=$2
     local i
@@ -360,14 +375,8 @@ increment_skip_count() {
 
 reset_skip_count() {
     local tun=$1
-    local file="${DATA_PATH}/tun_skip_count_${tun}"
-    if [ -n "$tun" ]; then
-        echo 0 > "$file" 2>/dev/null || true
-        LOG INFO "Skip count reset for tun${tun}"
-    else
-        rm -f "${DATA_PATH}/tun_skip_count_*" 2>/dev/null || true
-        LOG INFO "All skip counts reset"
-    fi
+    echo 0 > "${DATA_PATH}/tun_skip_count_${tun}" 2>/dev/null || true
+    LOG INFO "Skip count reset for tun${tun}"
 }
 
 for TUN in "${!TUN_TO_HOST[@]}"; do
@@ -467,6 +476,8 @@ format_bytes() {
 
 MAX_SKIP_COUNT=$((CYCLE_COUNT * ${#TUN_TO_HOST[@]}))
 SKIP_ROTATION=0
+SKIP_REASON=""
+PAUSED_REASON=""
 
 declare -A HOST_ROTATION
 
@@ -481,6 +492,7 @@ while true; do
     NOW=$(date +%s)
 
     HOST_ROTATION=()
+    SKIP_ROTATION=0
 
     for TUN in "${!TUN_TO_HOST[@]}"; do
         HOST=${TUN_TO_HOST[$TUN]}
@@ -504,20 +516,25 @@ while true; do
     if [ ${#TUN_TO_HOST[@]} -lt $MIN_UNIQUE_HOSTS ]; then
         LOG DEBUG "Only ${#TUN_TO_HOST[@]} tunnel(s) loaded. Skipping rotation logic."
         SKIP_ROTATION=1
+        SKIP_REASON="only ${#TUN_TO_HOST[@]} channel(s), ROTATION_MIN_UNIQUE_HOSTS=${MIN_UNIQUE_HOSTS}"
     fi
 
     if [ ${#UNIQUE_HOSTS[@]} -lt $MIN_UNIQUE_HOSTS ]; then
         LOG DEBUG "All tunnels point to the same host (${!UNIQUE_HOSTS[*]}). Skipping rotation logic."
         SKIP_ROTATION=1
+        SKIP_REASON="only ${#UNIQUE_HOSTS[@]} host(s) in TUNNELS, ROTATION_MIN_UNIQUE_HOSTS=${MIN_UNIQUE_HOSTS}"
     fi
 
     FREE_HOSTS=0
     for H in "${!UNIQUE_HOSTS[@]}"; do
-        [ -f "${DATA_PATH}/tun_host_${H}_busy" ] || FREE_HOSTS=$((FREE_HOSTS + 1))
+        if [ ! -f "${DATA_PATH}/tun_host_${H}_held" ] && [ -f "${DATA_PATH}/tun_host_${H}_loaded" ]; then
+            FREE_HOSTS=$((FREE_HOSTS + 1))
+        fi
     done
     if [ $FREE_HOSTS -lt $MIN_UNIQUE_HOSTS ]; then
-        LOG DEBUG "Only ${FREE_HOSTS} host(s) not used by another server. Skipping rotation logic."
+        LOG DEBUG "Only ${FREE_HOSTS} host(s) set up and not used by another server. Skipping rotation logic."
         SKIP_ROTATION=1
+        SKIP_REASON="only ${FREE_HOSTS} host(s) set up and not held off, ROTATION_MIN_UNIQUE_HOSTS=${MIN_UNIQUE_HOSTS}"
     fi
 
     should_skip_rotation
@@ -525,18 +542,25 @@ while true; do
 
     if [ "$RESULT" -eq 1 ]; then
         SKIP_ROTATION=1
-    elif [ "$RESULT" -eq 0 ]; then
-        SKIP_ROTATION=0
     fi
 
     if [ $SKIP_ROTATION -eq 1 ]; then
-        wait 10
+        if [ "$PAUSED_REASON" != "$SKIP_REASON" ]; then
+            LOG INFO "Rotation paused: ${SKIP_REASON}"
+            PAUSED_REASON=$SKIP_REASON
+        fi
+        wait_watching 10
         continue
+    fi
+
+    if [ -n "$PAUSED_REASON" ]; then
+        LOG INFO "Rotation resumed"
+        PAUSED_REASON=""
     fi
 
     LAST_ONLINE=$(get_last_online)
     if [ $((NOW - LAST_ONLINE)) -lt $MIN_STABLE_TIME ]; then
-        wait 1
+        wait_watching 1
         continue
     fi
 
@@ -578,12 +602,13 @@ while true; do
         LAST_ROTATE=$(get_last_rotate "$TUN")
         TIME_SINCE_LAST=$((NOW - LAST_ROTATE))
 
-        SCORE=$TIME_SINCE_LAST
+        SKIP_COUNTER=$(get_skip_count "$TUN")
 
-        # Lower the priority of recently rotated channels
-        if [ $TIME_SINCE_LAST -lt $MIN_CHANNEL_INTERVAL ]; then
-            SCORE=$((SCORE / 5))
+        if [ $TIME_SINCE_LAST -lt $MIN_CHANNEL_INTERVAL ] && [ "$SKIP_COUNTER" -lt "$MAX_SKIP_COUNT" ]; then
+            continue
         fi
+
+        SCORE=$TIME_SINCE_LAST
 
         AVG_CONNECT=$(get_avg_connect_duration "$TUN" 5)
 
@@ -591,8 +616,6 @@ while true; do
         if [ "$AVG_CONNECT" -gt 0 ]; then
             SCORE=$((SCORE * 100 / (100 + AVG_CONNECT * (AVG_SPREAD + 1))))
         fi
-
-        SKIP_COUNTER=$(get_skip_count "$TUN")
 
         if [ "$SKIP_COUNTER" -ge "$MAX_SKIP_COUNT" ]; then
             SCORE=$((SCORE + 1000000))
@@ -610,7 +633,7 @@ while true; do
     done
 
     if [ "$BEST_TUN" -eq 0 ]; then
-        wait 8
+        wait_watching 8
         continue
     fi
 
@@ -630,7 +653,7 @@ while true; do
 
     LOG INFO "Scheduler selected tun${BEST_TUN} on ${HOST} for rotation (${SELECTED_BY}, waiting ${EFFECTIVE_ROTATE}s)"
 
-    wait $EFFECTIVE_ROTATE "$BEST_TUN" # called without a subshell so that check_last_states_change can update LAST_STATES
+    wait_watching $EFFECTIVE_ROTATE "$BEST_TUN" # called without a subshell so that check_last_states_change can update LAST_STATES
     if [ $? -eq 1 ]; then
         LOG INFO "State change detected during pre-rotation wait. Skipping rotation of tun${BEST_TUN}"
         continue
@@ -638,7 +661,7 @@ while true; do
 
     ROTATION_FILE="${DATA_PATH}/tun_rotation_${BEST_TUN}"
 
-    echo "${NOW}" > "${ROTATION_FILE}"
+    write_file "${ROTATION_FILE}" "${NOW}"
     ./tun.post.balance.routing "remove" "${BEST_TUN}" "${#TUN_TO_HOST[@]}" "${CONFIG}" "drop" 2>/dev/null || true
 
     if [ ! -f "${DATA_PATH}/tun_host_${HOST}_disabled" ]; then
@@ -679,9 +702,9 @@ while true; do
 
     ./tun.post.balance.remove "${BEST_TUN}" "10.${BEST_TUN}.${BEST_TUN}.2" "${#TUN_TO_HOST[@]}" "${CONFIG}" 2>/dev/null || true
     
-    echo "0" > "${ROTATION_FILE}"
-
     tunnel_kill_by_tun "${BEST_TUN}"
+
+    write_file "${ROTATION_FILE}" 0
 
     find "${DATA_PATH}" -name "tun_host_*.lock" -type d -delete 2>/dev/null || true
     
@@ -689,7 +712,7 @@ while true; do
         mkdir "${DATA_PATH}/tun_host_${HOST}.lock" 2>/dev/null || true
     fi
     
-    date +%s > "${DATA_PATH}/tun_last_rotate_${BEST_TUN}"
+    write_file "${DATA_PATH}/tun_last_rotate_${BEST_TUN}" "$(date +%s)"
 
     for TUN in "${!TUN_TO_HOST[@]}"; do
         if [ "$TUN" != "$BEST_TUN" ]; then
@@ -699,7 +722,7 @@ while true; do
         fi
     done
 
-    wait $MIN_STABLE_TIME
+    wait_watching $MIN_STABLE_TIME
 
     LOG INFO "Rotation of tun${BEST_TUN} completed"
 done

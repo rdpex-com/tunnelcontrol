@@ -1,0 +1,123 @@
+#!/bin/bash
+# tun.web.cert create|renew|expiry
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+MODE=${1:-renew}
+
+source ./tun.logger
+source ./tun.env
+
+CERT_PATH="${DATA_PATH}/cert"
+CA_KEY="${CERT_PATH}/ca.key"
+CA_CERT="${CERT_PATH}/ca.pem"
+SITE_KEY="${CERT_PATH}/privkey.pem"
+SITE_CHAIN="${CERT_PATH}/fullchain.pem"
+RENEW_DAYS=30
+
+cert_address() {
+    local address=${WEB_CERT_ADDRESS} iface
+    if [ -z "$address" ]; then
+        iface=$(sed -nE 's/^[[:space:]]*CONFIG=["\x27]?([^:"\x27[:space:]]*):.*/\1/p' ./tun.config | tail -n 1)
+        address=$(ip -4 -o addr show dev "${iface}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)
+    fi
+    echo "$address"
+}
+
+issue_site() {
+    local work=$1 ca_key=$2 ca_cert=$3 names output
+
+    if [[ ${ADDRESS} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        names="DNS:${ADDRESS},IP:${ADDRESS}"
+    else
+        names="DNS:${ADDRESS}"
+    fi
+    printf '%s\n' \
+        "basicConstraints = critical, CA:FALSE" \
+        "keyUsage = critical, digitalSignature, keyEncipherment" \
+        "extendedKeyUsage = serverAuth" \
+        "subjectAltName = ${names}" > "${work}/site.ext"
+
+    if ! output=$(openssl req -new -nodes -newkey rsa:2048 -keyout "${work}/privkey.pem" -out "${work}/site.csr" \
+            -subj "/CN=${ADDRESS}" 2>&1) \
+        || ! output=$(openssl x509 -req -in "${work}/site.csr" -CA "$ca_cert" -CAkey "$ca_key" \
+            -set_serial "0x$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" -days "${WEB_CERT_SITE_DAYS}" -sha256 \
+            -extfile "${work}/site.ext" -out "${work}/site.pem" 2>&1); then
+        LOG ERROR "Issuing the web panel site certificate failed: ${output}"
+        return 1
+    fi
+    cat "${work}/site.pem" "$ca_cert" > "${work}/fullchain.pem"
+}
+
+site_has_address() {
+    local check=-checkhost
+    [[ ${ADDRESS} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && check=-checkip
+    openssl x509 -in "$SITE_CHAIN" -noout "$check" "$ADDRESS" 2>/dev/null | grep -q " does match "
+}
+
+site_days() {
+    local start end
+    start=$(date -d "$(openssl x509 -in "$SITE_CHAIN" -noout -startdate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null) || return 0
+    end=$(date -d "$(openssl x509 -in "$SITE_CHAIN" -noout -enddate 2>/dev/null | cut -d= -f2)" +%s 2>/dev/null) || return 0
+    echo $(((end - start) / 86400))
+}
+
+ADDRESS=$(cert_address)
+if [ -z "$ADDRESS" ]; then
+    LOG ERROR "Cannot determine the web panel address for its certificate: set WEB_CERT_ADDRESS in tun.config"
+    exit 1
+fi
+
+[ -d "${CERT_PATH}" ] || { mkdir -p "$(dirname "${CERT_PATH}")" && mkdir -m 700 "${CERT_PATH}"; } || exit 1
+WORK=$(mktemp -d "${CERT_PATH}/.new.XXXXXX") || exit 1
+trap 'rm -rf "$WORK"' EXIT
+chmod 700 "$WORK"
+
+case "$MODE" in
+    create)
+        LOG NOTICE "Creating the web panel certificate authority and site certificate for ${ADDRESS}..."
+        if ! OUTPUT=$(openssl req -x509 -new -nodes -newkey rsa:2048 -days "${WEB_CERT_DAYS}" -sha256 \
+                -keyout "${WORK}/ca.key" -out "${WORK}/ca.pem" -subj "/CN=Tunnel Control panel CA ${ADDRESS}" \
+                -addext "basicConstraints = critical, CA:TRUE" -addext "keyUsage = critical, keyCertSign, cRLSign" 2>&1); then
+            LOG ERROR "Creating the web panel certificate authority failed: ${OUTPUT}"
+            exit 1
+        fi
+        issue_site "$WORK" "${WORK}/ca.key" "${WORK}/ca.pem" || exit 1
+        chmod 600 "${WORK}/ca.key" "${WORK}/privkey.pem"
+        mv -f "${WORK}/ca.key" "$CA_KEY" && mv -f "${WORK}/ca.pem" "$CA_CERT" \
+            && mv -f "${WORK}/privkey.pem" "$SITE_KEY" && mv -f "${WORK}/fullchain.pem" "$SITE_CHAIN" || exit 1
+        LOG NOTICE "Web panel certificate created: ${WEB_CERT_SITE_DAYS} days for the site, ${WEB_CERT_DAYS} days for the authority to install on devices"
+        exit 3
+        ;;
+    renew|expiry)
+        [ -f "$CA_KEY" ] && [ -f "$CA_CERT" ] || exit 0
+        LEVEL=NOTICE
+        if [ ! -f "$SITE_KEY" ] || [ ! -f "$SITE_CHAIN" ]; then
+            REASON="it is missing"
+        elif ! openssl x509 -in "$SITE_CHAIN" -noout -checkend $((RENEW_DAYS * 86400)) > /dev/null 2>&1; then
+            REASON="it ends in less than ${RENEW_DAYS} days"
+        elif [ "$MODE" = "expiry" ]; then
+            exit 0
+        elif ! site_has_address; then
+            REASON="it is not for ${ADDRESS}"
+            LEVEL=WARN
+        elif [ "$(site_days)" != "${WEB_CERT_SITE_DAYS}" ]; then
+            REASON="its validity is not WEB_CERT_SITE_DAYS"
+            LEVEL=WARN
+        else
+            exit 0
+        fi
+        LOG "$LEVEL" "Renewing the web panel site certificate for ${ADDRESS} (${WEB_CERT_SITE_DAYS} days), ${REASON}; the certificate on the devices stays valid"
+        issue_site "$WORK" "$CA_KEY" "$CA_CERT" || exit 1
+        chmod 600 "${WORK}/privkey.pem"
+        mv -f "${WORK}/privkey.pem" "$SITE_KEY" && mv -f "${WORK}/fullchain.pem" "$SITE_CHAIN" || exit 1
+        exit 3
+        ;;
+    *)
+        echo "Usage: tun.web.cert create|renew|expiry"
+        exit 1
+        ;;
+esac

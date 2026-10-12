@@ -1,10 +1,10 @@
-import { initDebugMode, logDebug, clearDebug } from './debug.js';
+import { initDebugMode, logDebug, clearDebug, copyDebug, disableDebug } from './debug.js';
 import { Platform } from './platform.js';
 import { toggleOfflineMode, adaptForPwa, restoreTabFromHash, switchTab, showContent, showSystemInfo, showConfirmDialog, showToast } from './ui.js';
 import { loadStatus, startChart } from './dashboard.js';
-import { updateServiceStatus, controlService, refreshAll } from './service.js';
+import { updateServiceStatus, controlService } from './service.js';
 import { loadConfig, saveConfig, loadLogs, updateSysInfo, updateTunStatus } from './api.js';
-import { initPushNotifications, updateNotificationButton, requestNotificationPermission } from './push-notifications.js';
+import { initPushNotifications, updateNotificationButton, requestNotificationPermission, pushIsOff } from './push-notifications.js';
 import { changeLogType, refreshLogs, toggleAutoScroll, startLogAutoRefresh } from './logs.js';
 import { checkCertificateTrust, describeCertificateCheck, certificateInstallHtml } from './cert-check.js';
 
@@ -23,9 +23,34 @@ async function updateLogoutButton() {
 
 window.logout = async () => {
     try {
+        if ('serviceWorker' in navigator && navigator.serviceWorker.controller) {
+            const registration = await navigator.serviceWorker.ready;
+            const subscription = await registration.pushManager.getSubscription();
+            if (subscription) {
+                const res = await fetch('/api/push/unsubscribe', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ endpoint: subscription.endpoint })
+                });
+                const result = await res.json();
+                if (result.unsubscribed) await subscription.unsubscribe();
+            }
+        }
+    } catch (e) {
+        logDebug('logout push error', e.message);
+    }
+    try {
         await fetch('/api/auth/logout', { method: 'POST' });
     } catch (e) {
         logDebug('logout error', e.message);
+    }
+    try {
+        if ('caches' in window) {
+            const keys = await caches.keys();
+            await Promise.all(keys.filter(key => key.startsWith('tunnel-dynamic-')).map(key => caches.delete(key)));
+        }
+    } catch (e) {
+        logDebug('logout cache error', e.message);
     }
     location.replace('/login.html');
 };
@@ -162,7 +187,7 @@ export function loadTabContent(tabIndex) {
             updateStatusInterval = null;
         }
 
-        updateStatusInterval = setInterval(loadStatus, 5000);
+        updateStatusInterval = setInterval(() => { if (window.currentTab === 0) loadStatus(); }, 5000);
     }
     else if (tabIndex === 1) { // Configuration
         content.innerHTML = `
@@ -176,16 +201,23 @@ export function loadTabContent(tabIndex) {
                     </button>
                 </div>
 
-                <textarea id="config-editor"
-                    class="allow-scroll allow-select w-full
-                        bg-gray-100 dark:bg-gray-900
-                        text-gray-900 dark:text-gray-100
-                        font-mono text-sm p-5 rounded-2xl
-                        border border-gray-300 dark:border-gray-700
-                        focus:border-blue-500 dark:focus:border-blue-500
-                        outline-none resize-none min-h-0 flex-1"
-                        spellcheck="false">Loading config...
-                </textarea>
+                <div class="relative flex-1 min-h-0 rounded-2xl bg-gray-100 dark:bg-gray-900">
+                    <div id="config-backdrop" aria-hidden="true"
+                        class="absolute inset-0 overflow-hidden pointer-events-none
+                            font-mono text-sm p-5 rounded-2xl border border-transparent
+                            whitespace-pre-wrap break-words text-transparent"></div>
+                    <textarea id="config-editor"
+                        class="allow-scroll allow-select absolute inset-0 block w-full h-full
+                            bg-transparent
+                            text-gray-900 dark:text-gray-100
+                            font-mono text-sm p-5 rounded-2xl
+                            border border-gray-300 dark:border-gray-700
+                            focus:border-blue-500 dark:focus:border-blue-500
+                            outline-none resize-none"
+                            spellcheck="false">Loading config...
+                    </textarea>
+                </div>
+                <div id="config-error-hint" class="min-h-[1.25rem] mt-2 text-xs text-red-600 dark:text-red-400"></div>
 
                 <div class="flex justify-end mt-3">
                     <label class="relative inline-flex cursor-pointer items-center gap-2">
@@ -222,7 +254,7 @@ export function loadTabContent(tabIndex) {
                 <span><strong>Esc</strong> — exit editor</span>
                 <span><strong>Ctrl+S</strong> — save</span>
             `;
-            textarea.parentNode.insertBefore(configHintElement, textarea.nextSibling);
+            textarea.parentNode.parentNode.insertBefore(configHintElement, textarea.parentNode.nextSibling);
         }
 
         function hideConfigHint() {
@@ -232,13 +264,90 @@ export function loadTabContent(tabIndex) {
             }
         }
 
+        let configErrors = [];
+
+        function escapeHtml(text) {
+            return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        }
+
+        function configErrorLines(lines) {
+            return configErrors.map(error => {
+                let best = -1;
+                lines.forEach((line, index) => {
+                    if (line.trim() && line === error.text &&
+                        (best === -1 || Math.abs(index - error.line) < Math.abs(best - error.line))) best = index;
+                });
+                return best;
+            });
+        }
+
+        function renderConfigErrors() {
+            const textarea = document.getElementById('config-editor');
+            const backdrop = document.getElementById('config-backdrop');
+            if (!textarea || !backdrop) return;
+
+            const lines = textarea.value.split('\n');
+            const marked = new Set(configErrorLines(lines));
+            backdrop.style.paddingRight = `${20 + textarea.offsetWidth - textarea.clientWidth - 2}px`;
+            backdrop.innerHTML = lines.map((line, index) =>
+                marked.has(index)
+                    ? `<mark class="rounded bg-red-500/30 text-transparent">${escapeHtml(line)}</mark>`
+                    : escapeHtml(line)
+            ).join('\n') + '\n';
+            backdrop.scrollTop = textarea.scrollTop;
+            showConfigErrorHint();
+        }
+
+        function showConfigErrorHint() {
+            const textarea = document.getElementById('config-editor');
+            const hint = document.getElementById('config-error-hint');
+            if (!textarea || !hint) return;
+
+            const value = textarea.value;
+            const current = value.substring(0, textarea.selectionStart).split('\n').length - 1;
+            const errorLines = configErrorLines(value.split('\n'));
+
+            hint.textContent = configErrors
+                .filter((error, index) => errorLines[index] === current)
+                .map(error => error.message)
+                .join('; ');
+        }
+
+        let recheckTimer = null;
+
+        function scheduleConfigRecheck(delay = 600) {
+            clearTimeout(recheckTimer);
+            recheckTimer = setTimeout(async () => {
+                const textarea = document.getElementById('config-editor');
+                if (!textarea || !window.configLoaded) return;
+                const content = textarea.value;
+                try {
+                    const res = await fetch('/api/config/check', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ content })
+                    });
+                    const data = await res.json();
+                    if (data.success && Array.isArray(data.errors) && textarea.value === content) window.showConfigErrors(content, data.errors);
+                } catch (e) {
+                    logDebug('config recheck error', e.message);
+                }
+            }, delay);
+        }
+
+        window.showConfigErrors = (content, errors) => {
+            const lines = content.split('\n');
+            configErrors = errors.map(error => ({ text: lines[error.line - 1] ?? '', line: error.line - 1, message: error.message }));
+            renderConfigErrors();
+        };
+
         // === Handling of Tab / Shift+Tab / Esc / Ctrl+S ===
         function enableTabForTextarea(textarea) {
             if (!textarea) return;
 
             textarea.addEventListener('keydown', async function(e) {
                 // Ctrl/Cmd + S
-                if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+                if ((e.ctrlKey || e.metaKey) && e.code === 'KeyS') {
                     e.preventDefault();
                     if (typeof window.saveConfig === 'function') {
                         await window.saveConfig();
@@ -286,7 +395,20 @@ export function loadTabContent(tabIndex) {
             // Change tracking
             textarea.addEventListener('input', () => {
                 window.showButtonSave(textarea);
+                renderConfigErrors();
+                scheduleConfigRecheck();
             });
+
+            textarea.addEventListener('scroll', () => {
+                const backdrop = document.getElementById('config-backdrop');
+                if (backdrop) backdrop.scrollTop = textarea.scrollTop;
+            });
+            ['click', 'keyup', 'select'].forEach(type => textarea.addEventListener(type, showConfigErrorHint));
+            window.onConfigResize = renderConfigErrors;
+            if (!window.configResizeBound) {
+                window.configResizeBound = true;
+                window.addEventListener('resize', () => window.onConfigResize());
+            }
         }
 
         window.configLoaded = false;
@@ -299,6 +421,7 @@ export function loadTabContent(tabIndex) {
                 window.originalConfig = textarea.value;
                 window.configDirty = false;
                 enableTabForTextarea(textarea);
+                scheduleConfigRecheck(0);
             }
         }, 100);
 
@@ -321,6 +444,8 @@ export function loadTabContent(tabIndex) {
                             <option value="verbose">Verbose Log</option>
                             <option value="mon_total">Monitor Total</option>
                             <option value="mon_verbose">Monitor Verbose</option>
+                            <option value="mon_debug">Monitor Debug</option>
+                            <option value="mon_errors">Monitor Errors</option>
                         </select>
                         
                         <button onclick="window.refreshLogs()" 
@@ -428,14 +553,6 @@ export function loadTabContent(tabIndex) {
                             Restart Tunnel Service
                         </button>
                         
-                        <button onclick="window.refreshAll()" 
-                                class="w-full bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 
-                                    px-6 py-3 rounded-2xl font-medium flex items-center justify-center gap-2 
-                                    text-gray-900 dark:text-white transition-colors">
-                            <i class="fas fa-sync"></i> 
-                            Refresh All Data
-                        </button>
-                        
                         <div class="mb-6">
                             <button id="enable-push-btn" 
                                     onclick="window.requestNotificationPermission()" 
@@ -482,9 +599,8 @@ export function loadTabContent(tabIndex) {
     updateSysInfo();
 }
 
-const protectedSwitchTab = async (newTabIndex) => {
-    // Protection of unsaved changes on the Configuration tab
-    if (window.currentTab === 1 && newTabIndex !== window.currentTab && window.configLoaded && window.hasUnsavedConfigChanges()) {        
+const confirmLeaveConfig = async () => {
+    if (window.currentTab === 1 && window.configLoaded && window.hasUnsavedConfigChanges()) {
         const result = await window.showConfirmDialog({
             title: 'Unsaved changes',
             message: 'You have unsaved changes in tun.config.\nDo you want to save them before leaving?',
@@ -503,12 +619,17 @@ const protectedSwitchTab = async (newTabIndex) => {
                     console.error('[Config] Failed to save on tab switch:', e);
                 }
             }
-            if (!saved) return;
+            if (!saved) return false;
         } else if (result === 'cancel') {
-            return; // Do not switch
+            return false;
         }
-        // On 'discard', just continue switching
     }
+    return true;
+};
+
+const protectedSwitchTab = async (newTabIndex) => {
+    if (newTabIndex === window.currentTab) return;
+    if (!(await confirmLeaveConfig())) return;
 
     window.configLoaded = false;
 
@@ -524,9 +645,10 @@ Object.assign(window, {
     refreshLogs,
     toggleAutoScroll,
     controlService,
-    refreshAll,
     requestNotificationPermission,
     clearDebug,
+    copyDebug,
+    disableDebug,
     showConfirmDialog,
     showToast
 });
@@ -592,7 +714,9 @@ function showUpdateBanner() {
     }
 }
 
-function showCertificateBanner() {
+async function showCertificateBanner() {
+    if (document.getElementById('cert-banner')) return;
+    const features = (await pushIsOff()) ? 'updates and offline mode' : 'updates, push notifications and offline mode';
     if (document.getElementById('cert-banner')) return;
 
     const banner = document.createElement('div');
@@ -606,11 +730,11 @@ function showCertificateBanner() {
     `.trim();
     banner.innerHTML = `
         <span class="font-medium px-1">
-            This device does not trust the panel certificate, so updates, push notifications and offline mode may not work.
+            This device does not trust the panel certificate, so ${features} may not work.
         </span>
         <div class="text-sm px-1 opacity-90">${certificateInstallHtml()}</div>
         <div class="flex gap-3">
-            <a href="/cert.pem" download="tun-panel.crt"
+            <a href="/cert.pem"
                class="bg-white text-yellow-700 hover:bg-gray-100
                    px-6 py-2.5 rounded-2xl font-semibold text-sm text-center flex-1">
                 Download Certificate
@@ -672,6 +796,7 @@ function showCertificateLostBanner() {
 
 window.resetApp = async function() {
     try {
+        sessionStorage.setItem('swReset', '1');
         const registrations = await navigator.serviceWorker.getRegistrations();
         await Promise.all(registrations.map(registration => registration.unregister()));
         const keys = await caches.keys();
@@ -724,6 +849,21 @@ async function showVersion(appVersion) {
 }
 
 // ====================== INIT ======================
+function fitMobileHeader() {
+    const title = document.getElementById('main-title');
+    if (!title || !document.documentElement.classList.contains('mobile')) return;
+
+    let size = 30;
+    title.style.fontSize = `${size}px`;
+    while (size > 18 && title.getBoundingClientRect().height > size * 1.5) {
+        size -= 0.5;
+        title.style.fontSize = `${size}px`;
+    }
+    document.querySelectorAll('.header-mark').forEach(mark => {
+        mark.style.width = mark.style.height = `${Math.round(size * 1.93)}px`;
+    });
+}
+
 document.addEventListener('DOMContentLoaded', () => {
     setInterval(() => {
         toggleOfflineMode(!window.online);
@@ -732,7 +872,20 @@ document.addEventListener('DOMContentLoaded', () => {
     initDebugMode();
     restoreTabFromHash();
     adaptForPwa();
-    window.addEventListener('hashchange', restoreTabFromHash);
+    fitMobileHeader();
+    document.fonts?.ready.then(fitMobileHeader);
+    window.addEventListener('resize', fitMobileHeader);
+    window.addEventListener('hashchange', async () => {
+        const target = hashToTab[window.location.hash.substring(1)] ?? 0;
+        if (target !== window.currentTab) {
+            if (!(await confirmLeaveConfig())) {
+                history.pushState(null, '', `#${tabHashes[window.currentTab]}`);
+                return;
+            }
+            window.configLoaded = false;
+        }
+        restoreTabFromHash();
+    });
 
     logDebug(`[App] Environment: secureContext=${window.isSecureContext}, serviceWorker=${'serviceWorker' in navigator}, ` +
         `pwa=${!!Platform.isPWA()}, ios=${Platform.isIOS()}, android=${Platform.isAndroid()}, ua=${navigator.userAgent}`);
@@ -751,8 +904,19 @@ document.addEventListener('DOMContentLoaded', () => {
     if ('serviceWorker' in navigator) {
         let registration;
 
+        let workerUrl = '/sw.js';
+        try {
+            if (sessionStorage.getItem('swReset') === '1') {
+                sessionStorage.removeItem('swReset');
+                workerUrl = `/sw.js?reset=${Date.now()}`;
+                logDebug('[App] Reset App: installing the service worker again');
+            }
+        } catch (e) {
+            logDebug('[App] Reset App mark error', e.message);
+        }
+
         window.addEventListener('load', () => {
-            navigator.serviceWorker.register('/sw.js')
+            navigator.serviceWorker.register(workerUrl)
                 .then(reg => {
                     registration = reg;
                     initPushNotifications();
@@ -761,7 +925,6 @@ document.addEventListener('DOMContentLoaded', () => {
                     // Check for updates every 30 seconds (for development)
                     setInterval(() => {
                         if (registration) {
-                            logDebug('[App] Checking for updates...');
                             registration.update().then(() => {
                                 updateFailures = 0;
                                 document.getElementById('cert-lost-banner')?.remove();
@@ -804,8 +967,9 @@ document.addEventListener('DOMContentLoaded', () => {
                         }
                     }
 
-                    if (navigator.serviceWorker.controller) {
-                        navigator.serviceWorker.controller.postMessage({ type: 'GET_VERSION' });
+                    const versionWorker = navigator.serviceWorker.controller || registration.active;
+                    if (versionWorker) {
+                        versionWorker.postMessage({ type: 'GET_VERSION' });
                     }
                 })
                 .catch(err => {
@@ -830,7 +994,11 @@ document.addEventListener('DOMContentLoaded', () => {
                     }
                 } else if (event.data.event === 'activate') {
                     logDebug('[App] Version info received during activate event');
+                    showVersion(window.appVersion);
                 } else {
+                    if (!localStorage.getItem('appVersion') && window.appVersion !== 'unknown') {
+                        localStorage.setItem('appVersion', window.appVersion);
+                    }
                     showVersion(window.appVersion);
                 }
             }
@@ -845,7 +1013,9 @@ document.addEventListener('DOMContentLoaded', () => {
             }
 
             if (event.data && event.data.type === 'ONLINE_STATUS') {
-                logDebug(`[App] Received online status from SW: ${event.data.online}`);
+                if (window.online !== event.data.online) {
+                    logDebug(`[App] Received online status from SW: ${event.data.online}`);
+                }
                 window.online = event.data.online;
             }
 

@@ -101,7 +101,7 @@ print_status() {
     local -a ids hosts host_tunnels
 
     pid=$(read_file tun_pid)
-    if [[ $pid =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    if [[ $pid =~ ^[0-9]+$ ]] && tr '\0' '\n' 2>/dev/null < "/proc/${pid}/cmdline" | grep -qx './tun.manager'; then
         if grep -q '/tun\.service$' "/proc/${pid}/cgroup" 2>/dev/null; then
             manager="running as the tun service (PID ${pid})"
         else
@@ -127,7 +127,7 @@ print_status() {
         fi
         address=${WEB_LISTEN}
         if [ -z "$address" ] || [ "$address" = "0.0.0.0" ]; then
-            iface=$(sed -n 's/^[[:space:]]*CONFIG="\([^:"]*\):.*/\1/p' ./tun.config | tail -n 1)
+            iface=$(sed -nE 's/^[[:space:]]*CONFIG=["\x27]?([^:"\x27[:space:]]*):.*/\1/p' ./tun.config | tail -n 1)
             address=$(ip -4 -o addr show dev "${iface}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)
         fi
         web="${scheme}://${address:-<server address>}:${web_port} ($(systemctl is-active tun-web 2>/dev/null))"
@@ -138,7 +138,7 @@ print_status() {
     fi
 
     echo "Tunnel Control™ Panel $(cat ./VERSION)"
-    echo "Tunnels: ${manager}; tun service: ${service}"
+    echo "Tunnels: ${manager}; tun service: ${service}; client route: $(read_file tun_routing_mode)"
     echo "Web panel: ${web}"
     echo
 
@@ -236,6 +236,7 @@ MESSAGE=""
 MESSAGE_UNTIL=0
 while true; do
     [ "$SECONDS" -ge "$MESSAGE_UNTIL" ] && MESSAGE=""
+    mapfile -t HOSTS < <(hosts_in_order)
     FRAME=$(print_status 1; echo; echo "${MESSAGE}"; echo "$(keys_hint). Refreshing every ${INTERVAL} s ($(date +%H:%M:%S))")
     [ "$QUIT" = "1" ] && quit
     printf '\033[H%s\033[K\033[J' "${FRAME//$'\n'/$'\033[K\n'}"
@@ -253,7 +254,6 @@ while true; do
             quit
             ;;
         [1-9])
-            mapfile -t HOSTS < <(hosts_in_order)
             if [ "$KEY" -le "${#HOSTS[@]}" ]; then
                 MESSAGE="$(date +%H:%M:%S) $(./tun.toggle "${HOSTS[$((KEY - 1))]}" 2>&1 | tail -n 1)"
                 MESSAGE_UNTIL=$((SECONDS + 10))

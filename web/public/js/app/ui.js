@@ -67,9 +67,9 @@ function updateActiveBottomNavAndHideSystemInfo(tabIndex) {
 export function adaptForPwa() {
     if (!Platform.isPWA()) {
         logDebug('🌐 Running in regular web mode');
+    } else {
+        logDebug('🚀 Running in PWA Standalone mode');
     }
-
-    logDebug('🚀 Running in PWA Standalone mode');
     
     const style = document.createElement('style')
     const viewport = document.createElement('meta');
@@ -108,7 +108,7 @@ export function adaptForPwa() {
             * { -webkit-touch-callout: none !important; -webkit-user-select: none !important; user-select: none !important; }
         `;
     } else {
-        logDebug('🖥️ Detected Desktop PWA');
+        logDebug('🖥️ Detected Desktop');
 
         viewport.content = 'width=device-width, initial-scale=1.0';
 
@@ -168,39 +168,8 @@ export function adaptForPwa() {
         }
     });
     
-    const headerContainer = document.getElementById('header-container');
-    const titleWrapper = document.getElementById('title-wrapper');
-    
-    if (headerContainer) {
-        headerContainer.classList.remove('items-center', 'pb-6');
-        headerContainer.classList.add('flex-col', 'items-start', 'pb-2');
-    }
-    
-    if (titleWrapper) {
-        titleWrapper.classList.add('mb-4'); 
-    }
-
-    const statusContainer = document.getElementById('status-container');
-    
-    if (statusContainer) {
-        statusContainer.classList.add('self-end', 'mt-[4px]');        
-    }
-
-    const tabs = document.getElementById('tabs');
-    if (tabs) {
-        tabs.style.display = 'none';
-    }
-
-    const mainContainer = document.getElementById('content-container');
-    if (mainContainer) {
-        mainContainer.classList.add('pwa-mode');
-    }
-
     logDebug('🚀 PWA mode: Bottom navigation enabled');
-    
-    const bottomNav = document.getElementById('bottom-nav');
-    if (bottomNav) bottomNav.classList.remove('hidden');
-       
+
     adaptForMobile(window.currentTab);
     updateActiveBottomNav();
     document.documentElement.classList.add('layout-ready');
@@ -489,44 +458,34 @@ export function showConfirmDialog(options = {}) {
         const cancelBtn = modal.querySelector('#btn-cancel');
         const discardBtn = modal.querySelector('#btn-discard');
 
-        confirmBtn.onclick = () => {
+        const close = (result) => {
             modal.remove();
-            resolve('confirm');
+            document.removeEventListener('keydown', handleEsc);
+            resolve(result);
         };
 
-        cancelBtn.onclick = () => {
-            modal.remove();
-            resolve('cancel');
+        const handleEsc = (e) => {
+            if (e.key === 'Escape') close('cancel');
         };
+
+        confirmBtn.onclick = () => close('confirm');
+        cancelBtn.onclick = () => close('cancel');
 
         if (discardBtn) {
-            discardBtn.onclick = () => {
-                modal.remove();
-                resolve('discard');
-            };
+            discardBtn.onclick = () => close('discard');
         }
 
         // Close on a click on the backdrop
         modal.onclick = (e) => {
-            if (e.target === modal) {
-                modal.remove();
-                resolve('cancel');
-            }
+            if (e.target === modal) close('cancel');
         };
 
         // Close on Escape
-        const handleEsc = (e) => {
-            if (e.key === 'Escape') {
-                modal.remove();
-                document.removeEventListener('keydown', handleEsc);
-                resolve('cancel');
-            }
-        };
-        document.addEventListener('keydown', handleEsc, { once: true });
+        document.addEventListener('keydown', handleEsc);
     });
 }
 
-export function showToast(message, type = 'success') {
+export function showToast(message, type = 'success', duration = 2800) {
     const toast = document.createElement('div');
     
     const bgColor = type === 'success' 
@@ -551,5 +510,5 @@ export function showToast(message, type = 'success') {
         toast.style.transition = 'all 0.3s ease';
         toast.style.opacity = '0';
         setTimeout(() => toast.remove(), 300);
-    }, 2800);
+    }, duration);
 };

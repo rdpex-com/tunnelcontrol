@@ -16,9 +16,15 @@ if ! flock -n 9; then
 fi
 
 INFO=$("$(dirname "$(readlink -f "$0")")/tunnelcontrol-host-info" --once)
+INFO_CODE=$?
 
 if ! vmrun -T ws writeVariable "$VMX" guestVar sysinfo "$INFO"; then
     echo "[$(date '+%H:%M:%S')] vmrun could not write guestinfo.sysinfo to ${VMX}"
+    exit 1
+fi
+
+if [ "$INFO_CODE" -ne 0 ] || [ -z "$INFO" ]; then
+    echo "[$(date '+%H:%M:%S')] tunnelcontrol-host-info failed (code ${INFO_CODE}), guestinfo.sysinfo cleared"
     exit 1
 fi
 

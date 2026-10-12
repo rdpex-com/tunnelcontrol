@@ -1,0 +1,409 @@
+#!/bin/bash
+# tun.manager
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+source ./tun.logger
+
+MANAGER_DATA_PATH=${DATA_PATH}
+source ./tun.config
+DATA_PATH=${MANAGER_DATA_PATH}
+source ./tun.env
+
+trap '' TSTP
+
+if [[ ! -t 0 ]]; then
+    trap '' TTIN TTOU
+fi
+
+IFS= read -r PASSWORD || PASSWORD=""
+
+TUNNEL_COUNT=${#TUNNELS[@]}
+MODE="balance"
+CIPHER="${TUNNEL_CIPHER}"
+WARN_THROTTLE=${MANAGER_WARN_THROTTLE}
+SETUP_TIMEOUT=${MANAGER_SETUP_TIMEOUT}
+WATCHDOG=${MANAGER_WATCHDOG}
+
+PID_FILE="${DATA_PATH}/tun_pid"
+STOP_FILE="${DATA_PATH}/tun_stop"
+
+uptime_seconds() {
+    local up _
+    read -r up _ < /proc/uptime
+    echo "${up%.*}"
+}
+
+write_file() {
+    local tmp="${1%/*}/.${1##*/}.tmp"
+    printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$1"
+}
+
+check_stop() {
+    if [ -f "${STOP_FILE}" ]; then
+        LOG INFO "Skipping by external signal..."
+        exit 0
+    fi
+}
+
+
+no_host_waits_for_setup() {
+    local host
+    for host in "${HOST_ORDER[@]}"; do
+        [ -f "${DATA_PATH}/tun_host_${host}_configured" ] || [ -f "${DATA_PATH}/tun_host_${host}_held" ] || return 1
+    done
+    return 0
+}
+
+
+declare -A HOSTS
+declare -a HOST_ORDER=()
+
+for entry in "${TUNNELS[@]}"; do
+    IFS=':' read -r HOST PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE WEIGHT <<< "$entry"
+    if [[ -z ${HOSTS[$HOST]+x} ]]; then
+        HOST_ORDER+=("$HOST")
+    fi
+    HOSTS["$HOST"]+="$PORT:$PORT_RANGE:$IN_FACE:$PUBLIC_IP:$OUT_FACE:$WEIGHT "
+done
+
+declare -A HOST_TO_PARAMS
+declare -A HOST_TUNS
+declare -A TUN_TO_HOST
+declare -A TUN_PARAMS
+
+READY_FILE="${DATA_PATH}/tun_manager_ready"
+rm -f "${READY_FILE}"
+
+ROTATION_SCHEDULER_PID=0
+TEST_PID=0
+
+for HOST in "${HOST_ORDER[@]}"; do
+    # Exceptions (high priority)
+    ip rule add from all to "$HOST" table main priority 51 2>/dev/null || true
+
+    read -ra TUNNEL_LIST <<< "${HOSTS[$HOST]}"
+
+    HOST_TUNS["$HOST"]=0
+
+    for tunnel in "${TUNNEL_LIST[@]}"; do
+        IFS=':' read -r PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE WEIGHT <<< "$tunnel"
+        TUN=$((++GLOBAL_TUN))
+
+        HOST_TUNS["$HOST"]=$((HOST_TUNS["$HOST"] + 1))
+        TUN_TO_HOST["$TUN"]="$HOST"
+        TUN_PARAMS["$TUN"]="$MODE $TUN $HOST $PORT $PORT_RANGE $IN_FACE $PUBLIC_IP $OUT_FACE $WEIGHT $TUNNEL_COUNT"
+    done
+
+    IFS=':' read -r PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE WEIGHT <<< "${TUNNEL_LIST[0]}"
+    HOST_TO_PARAMS["$HOST"]="$PORT $PORT_RANGE $IN_FACE $PUBLIC_IP $OUT_FACE"
+done
+
+LOG INFO "Starting centralized rotation scheduler"
+
+ARGS=()
+for TUN in "${!TUN_TO_HOST[@]}"; do
+    LOG DEBUG "Scheduling rotation for tun${TUN} (${TUN_TO_HOST[$TUN]})"
+    ARGS+=("$TUN" "${TUN_TO_HOST[$TUN]}")
+done
+
+LOG DEBUG "Rotation scheduler arguments: ${ARGS[*]}"
+nohup ./tun.rotation.scheduler "${ARGS[@]}" "${CONFIG}" >/dev/null 2>&1 &
+ROTATION_SCHEDULER_PID=$!
+
+LOG INFO "Starting traffic monitor"
+nohup ./tun.test >/dev/null 2>&1 &
+TEST_PID=$!
+
+(
+    trap '' HUP
+
+    declare -A MONITORS
+    declare -A HOST_MONITORED
+    declare -A SETUP_PID
+    declare -A SETUP_KIND
+    declare -A SETUP_START
+    declare -A LAST_WARN_TIME
+    declare -A LAST_ERROR_COUNT
+    declare -A HOST_PREV_STATE
+
+    start_setup() {
+        local host=$1 kind=$2 port port_range in_face public_ip out_face pass=""
+
+        IFS=' ' read -r port port_range in_face public_ip out_face <<< "${HOST_TO_PARAMS[$host]}"
+        [ -f "${DATA_PATH}/tun_host_${host}_configured" ] || pass=${PASSWORD:-}
+        if [ -f "${READY_FILE}" ]; then
+            setsid ./tun.server.setup "$host" "$port" "$port_range" "$in_face" "$public_ip" "$out_face" "$CIPHER" 3<<< "$pass" > /dev/null 2>&1 &
+        else
+            setsid ./tun.server.setup "$host" "$port" "$port_range" "$in_face" "$public_ip" "$out_face" "$CIPHER" 3<<< "$pass" &
+        fi
+        SETUP_PID["$host"]=$!
+        SETUP_KIND["$host"]=$kind
+        SETUP_START["$host"]=$(uptime_seconds)
+    }
+
+    start_monitors() {
+        local host=$1 tun mode tun_id tun_host port port_range in_face public_ip out_face weight count
+
+        [ -n "${HOST_MONITORED[$host]:-}" ] && return 0
+        HOST_MONITORED["$host"]=1
+
+        for tun in $(printf '%s\n' "${!TUN_TO_HOST[@]}" | sort -n); do
+            [ "${TUN_TO_HOST[$tun]}" = "$host" ] || continue
+            IFS=' ' read -r mode tun_id tun_host port port_range in_face public_ip out_face weight count <<< "${TUN_PARAMS[$tun]}"
+            LOG INFO "Starting monitor for tun${tun_id} ($tun_host:$port_range)"
+            nohup ./tun.monitor "$mode" "$tun_id" "$tun_host" "$port" "$port_range" "$in_face" "$public_ip" "$out_face" "$weight" "$count" "$CONFIG" >/dev/null 2>&1 &
+            MONITORS["$!"]="${TUN_PARAMS[$tun]}"
+        done
+    }
+
+    finish_setup() {
+        local host=$1 kind=${SETUP_KIND[$1]} rc=0 host_exit_code host_code tun
+
+        wait "${SETUP_PID[$host]}" || rc=$?
+        unset 'SETUP_PID[$host]' 'SETUP_KIND[$host]' 'SETUP_START[$host]'
+
+        if [ "$rc" -eq 0 ]; then
+            if [ "$kind" = "recovery" ]; then
+                LOG INFO "Successfully loaded tun.server on $host and ready to relaunch tunnels"
+
+                for tun in "${!TUN_TO_HOST[@]}"; do
+                    if [ "$host" = "${TUN_TO_HOST[$tun]}" ]; then
+                        LOG DEBUG "Resetting SSH exit code for tun${tun}"
+                        rm -f "${DATA_PATH}/tun_ssh_exit_code_${tun}" 2>/dev/null || true
+                    fi
+                done
+
+                rm -f "${DATA_PATH}/tun_ssh_exit_code_${host}" 2>/dev/null || true
+            else
+                LOG INFO "Successfully loaded tun.server on $host and ready to launch tunnels"
+            fi
+            start_monitors "$host"
+            return 0
+        fi
+
+        host_exit_code="${DATA_PATH}/tun_ssh_exit_code_${host}"
+        host_code=$(cat "${host_exit_code}" 2>/dev/null || echo "0")
+
+        if [ "$host_code" -ge 5 ] && [ "$host_code" -le 8 ]; then
+            LOG ERROR "Host $host is held off: its tunnels stay off until the tunnels are restarted."
+            return 0
+        fi
+
+        if [ "$kind" = "recovery" ]; then
+            LOG ERROR "Failed to load tun.server on $host. Will retry in about $((WARN_THROTTLE * 2)) seconds."
+            LAST_WARN_TIME["$host"]=$(( $(date +%s) + WARN_THROTTLE ))
+        else
+            if [ "$host_code" -eq 0 ]; then
+                LOG ERROR "Failed to load tun.server on $host without an exit code (unexpected abort). Will retry with normal throttle."
+                echo "255" > "${host_exit_code}"
+            else
+                LOG ERROR "Failed to load tun.server on $host. Will retry with normal throttle."
+            fi
+            LAST_WARN_TIME["$host"]=$(date +%s)
+            LAST_ERROR_COUNT["$host"]=${HOST_TUNS[$host]}
+        fi
+        start_monitors "$host"
+    }
+
+    for HOST in "${HOST_ORDER[@]}"; do
+        start_setup "$HOST" initial
+    done
+
+    while true; do
+        check_stop
+
+        for HOST in "${!SETUP_PID[@]}"; do
+            if kill -0 "${SETUP_PID[$HOST]}" 2>/dev/null; then
+                if [ $(( $(uptime_seconds) - SETUP_START[$HOST] )) -ge "$SETUP_TIMEOUT" ]; then
+                    LOG ERROR "Setup of host $HOST takes more than ${SETUP_TIMEOUT} seconds, stopping it"
+                    write_file "${DATA_PATH}/tun_ssh_exit_code_${HOST}" 255
+                    kill -TERM -- "-${SETUP_PID[$HOST]}" 2>/dev/null || true
+                fi
+            else
+                finish_setup "$HOST"
+            fi
+        done
+
+        INITIAL_LEFT=0
+        for HOST in "${!SETUP_KIND[@]}"; do
+            [ "${SETUP_KIND[$HOST]}" = "initial" ] && INITIAL_LEFT=$((INITIAL_LEFT + 1))
+        done
+        if [ ! -f "${READY_FILE}" ] && [ "$INITIAL_LEFT" -eq 0 ]; then
+            if [ -n "${PASSWORD:-}" ] && ! no_host_waits_for_setup; then
+                LOG INFO "Password kept in memory until all hosts complete first-time setup"
+            fi
+            if [ "${#MONITORS[@]}" -eq 0 ]; then
+                LOG WARN "No tunnel monitor started: every host is held off"
+            elif [ "${#MONITORS[@]}" -lt "${#TUN_TO_HOST[@]}" ]; then
+                LOG NOTICE "Tunnel monitors started for ${#MONITORS[@]} of ${#TUN_TO_HOST[@]} tunnels, held hosts stay off"
+            else
+                LOG NOTICE "All tunnel monitors started"
+            fi
+            touch "${READY_FILE}"
+            rm -f "${DATA_PATH}/tun_restarting"
+        fi
+
+        if [ -n "${PASSWORD:-}" ] && no_host_waits_for_setup; then
+            unset PASSWORD
+            LOG INFO "No host waits for its first setup, clearing password variable from memory"
+        fi
+
+        for pid in "${!MONITORS[@]}"; do
+            PARAMS="${MONITORS[$pid]}"
+            IFS=' ' read -r MODE TUN HOST PORT PORT_RANGE IN_FACE PUBLIC_IP OUT_FACE WEIGHT TUNNEL_COUNT <<< "$PARAMS"
+            if ! kill -0 "${pid}" 2>/dev/null; then
+                check_stop
+
+                LOG WARN "Monitor for tun${TUN} died unexpectedly. Restarting... ${PARAMS}"
+                nohup ./tun.monitor "$MODE" "$TUN" "$HOST" "$PORT" "$PORT_RANGE" "$IN_FACE" "$PUBLIC_IP" "$OUT_FACE" "$WEIGHT" "$TUNNEL_COUNT" "$CONFIG" >/dev/null 2>&1 &
+
+                MONITORS["$!"]="$PARAMS"
+                unset 'MONITORS[$pid]'
+
+                LOG INFO "Monitor for tun${TUN} restarted with new PID $!"
+            fi
+        done
+
+        LOG DEBUG "Monitors: ${#MONITORS[@]}"
+
+        declare -A HOST_ERRORS=()
+        declare -A HOST_TOTAL=()
+        declare -A HOST_ONLINE=()
+
+        for TUN in "${!TUN_TO_HOST[@]}"; do
+            HOST=${TUN_TO_HOST[$TUN]}
+            TUN_CODE=$(cat "${DATA_PATH}/tun_ssh_exit_code_${TUN}" 2>/dev/null || echo "0")
+            HOST_CODE=$(cat "${DATA_PATH}/tun_ssh_exit_code_${HOST}" 2>/dev/null || echo "0")
+
+            HOST_TOTAL["$HOST"]=$(( ${HOST_TOTAL[$HOST]:-0} + 1 ))
+            if [ "$(cut -d: -f1 "${DATA_PATH}/tun_state_${TUN}" 2>/dev/null)" = "ONLINE" ]; then
+                HOST_ONLINE["$HOST"]=$(( ${HOST_ONLINE[$HOST]:-0} + 1 ))
+            fi
+
+            if [ "$HOST_CODE" -ne 0 ]; then
+                HOST_ERRORS["$HOST"]=${HOST_TUNS["$HOST"]}
+                continue
+            fi
+
+            if [ "$TUN_CODE" = "255" ] || [ "$TUN_CODE" -eq 255 ]; then
+                HOST_ERRORS["$HOST"]=$(( ${HOST_ERRORS[$HOST]:-0} + 1 ))
+            fi
+        done
+
+        NOW=$(date +%s)
+
+        for HOST in "${!HOST_TOTAL[@]}"; do
+            [ -f "${DATA_PATH}/tun_host_${HOST}_held" ] && continue
+            [ -n "${SETUP_PID[$HOST]:-}" ] && continue
+
+            TOTAL=${HOST_TOTAL[$HOST]}
+            ERRORS=${HOST_ERRORS[$HOST]:-0}
+
+            LOG DEBUG "Host $HOST: $ERRORS out of $TOTAL tunnels"
+
+            if [ "$ERRORS" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+                CURRENT_STATE="DEAD"
+            elif [ "${HOST_ONLINE[$HOST]:-0}" -gt 0 ]; then
+                CURRENT_STATE="OK"
+            else
+                CURRENT_STATE=${HOST_PREV_STATE[$HOST]:-OK}
+            fi
+
+            PREV_STATE=${HOST_PREV_STATE[$HOST]:-OK}
+
+            if [ "$CURRENT_STATE" != "$PREV_STATE" ]; then
+                NOTIFICATION_FILE=/dev/null
+                if [ "${WEB_PANEL}" != "0" ] && [ "${WEB_PUSH}" != "0" ]; then
+                    mkdir -p "${DATA_PATH}/queue"
+                    NOTIFICATION_FILE="${DATA_PATH}/queue/message_$(date +%s%N).notify"
+                fi
+
+                if [ "$CURRENT_STATE" = "DEAD" ]; then
+                    LOG ERROR "Host $HOST state changed: OK → DEAD (${TOTAL} tunnels)"
+                    
+                    echo "Host $HOST is now DEAD ($TOTAL tunnels failed)" > "$NOTIFICATION_FILE"
+                else
+                    LOG NOTICE "Host $HOST state changed: DEAD → OK"
+                    
+                    echo "Host $HOST has recovered ($TOTAL tunnels OK)" > "$NOTIFICATION_FILE"
+                fi
+
+                HOST_PREV_STATE["$HOST"]="$CURRENT_STATE"
+            fi
+
+            if [ "$ERRORS" -gt 0 ]; then
+                LAST_HOST_WARN_TIME=${LAST_WARN_TIME[$HOST]:-0}
+                LAST_HOST_ERROR_COUNT=${LAST_ERROR_COUNT[$HOST]:-0}
+
+                if [ "$ERRORS" -gt "$LAST_HOST_ERROR_COUNT" ] || [ $((NOW - LAST_HOST_WARN_TIME)) -ge "$WARN_THROTTLE" ]; then
+                    if [ "$ERRORS" -eq "$TOTAL" ] && [ "$TOTAL" -gt 0 ]; then
+                        LOG ERROR "ALL tunnels to host $HOST are dead or not configured. ${TOTAL} tunnels failed."
+
+                        start_setup "$HOST" recovery
+                    else
+                        LOG WARN "$ERRORS out of $TOTAL tunnels to $HOST have SSH error"
+                    fi
+
+                    LAST_WARN_TIME["$HOST"]=$NOW
+                    LAST_ERROR_COUNT["$HOST"]=$ERRORS
+                fi
+            elif [ "${HOST_ONLINE[$HOST]:-0}" -gt 0 ]; then
+                if [ -n "${LAST_ERROR_COUNT[$HOST]}" ]; then
+                    LOG INFO "Tunnels to $HOST have recovered. Resetting warning state."
+                fi
+
+                unset 'LAST_WARN_TIME[$HOST]' 2>/dev/null || true
+                unset 'LAST_ERROR_COUNT[$HOST]' 2>/dev/null || true
+            fi
+        done
+
+        if ! kill -0 "$ROTATION_SCHEDULER_PID" 2>/dev/null; then
+            check_stop
+        
+            LOG WARN "Rotation scheduler died unexpectedly. Restarting..."
+            nohup ./tun.rotation.scheduler "${ARGS[@]}" "${CONFIG}" >/dev/null 2>&1 &
+            ROTATION_SCHEDULER_PID=$!
+        fi
+
+        if ! kill -0 "$TEST_PID" 2>/dev/null; then
+            check_stop
+
+            LOG WARN "Traffic monitor died unexpectedly. Restarting..."
+            nohup ./tun.test >/dev/null 2>&1 &
+            TEST_PID=$!
+        fi
+
+        if ! ip route show table 300 2>/dev/null | grep -q '^default'; then
+            for TUN in "${!TUN_TO_HOST[@]}"; do
+                [ "$(cut -d: -f1 "${DATA_PATH}/tun_state_${TUN}" 2>/dev/null)" = "ONLINE" ] || continue
+                [ -f "${DATA_PATH}/tun_host_${TUN_TO_HOST[$TUN]}_disabled" ] && continue
+                [ "$(cat "${DATA_PATH}/tun_rotation_${TUN}" 2>/dev/null || echo 0)" = "0" ] || continue
+                ip link show "tun${TUN}" > /dev/null 2>&1 || continue
+                LOG INFO "No route through the tunnels while tun${TUN} is up, rebuilding it"
+                ./tun.post.balance.routing "add" "${TUN}" "${#TUN_TO_HOST[@]}" "${CONFIG}" 2>/dev/null || true
+                break
+            done
+        fi
+
+        sleep 2
+    done
+) &
+
+MANAGER_PID=$!
+echo "${MANAGER_PID}" > "$PID_FILE"
+LOG INFO "Main tunnel manager PID: ${MANAGER_PID}"
+
+if [ "$WATCHDOG" = true ]; then
+    LOG INFO "Starting watchdog for main tunnel manager"
+    nohup ./tun.watchdog "$PID_FILE" >/dev/null 2>&1 &
+fi
+
+trap 'echo; LOG NOTICE "Interrupted: the VPS setup goes on in the background; tun --status shows the tunnels, tun --stop stops them"; exit 130' INT
+
+while [ ! -f "${READY_FILE}" ] && [ ! -f "${STOP_FILE}" ] && kill -0 "${MANAGER_PID}" 2>/dev/null; do
+    sleep 1
+done

@@ -1,0 +1,200 @@
+#!/bin/bash
+# tun.server.setup.job <public key>
+
+if [ "$(basename "$0")" != "setup.job" ]; then
+    echo "Error: this script runs on the VPS as /run/tunnelcontrol/setup.job. Do not run this script directly."
+    exit 1
+fi
+
+PUBKEY=${1:-}
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+SSHD_DROPIN_DIR="/etc/ssh/sshd_config.d"
+SSHD_DROPIN="${SSHD_DROPIN_DIR}/00-tunnelcontrol.conf"
+SSHD_WANTED="TCPKeepAlive yes
+ClientAliveInterval 10
+ClientAliveCountMax 3
+PermitTunnel yes"
+
+apt_lock_busy() {
+    local lock
+    for lock in /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend; do
+        [ -e "$lock" ] && grep -q ":$(stat -c %i "$lock") " /proc/locks && return 0
+    done
+    return 1
+}
+
+sshd_effective_ok() {
+    local effective key value
+    effective=$(sshd -T 2>/dev/null) || return 1
+    while read -r key value; do
+        grep -qix "${key} ${value}" <<< "$effective" || return 1
+    done <<< "$SSHD_WANTED"
+    return 0
+}
+
+step_key() {
+    echo "JOB-STEP: key"
+    [ -n "$PUBKEY" ] || { echo "JOB-FAIL: key: no public key given"; return 1; }
+    mkdir -p /root/.ssh && chmod 700 /root/.ssh || { echo "JOB-FAIL: key: cannot prepare /root/.ssh"; return 1; }
+    if grep -qxF "$PUBKEY" /root/.ssh/authorized_keys 2>/dev/null; then
+        echo "JOB-KEY: present"
+    else
+        [ -s /root/.ssh/authorized_keys ] && [ -n "$(tail -c 1 /root/.ssh/authorized_keys)" ] && echo >> /root/.ssh/authorized_keys
+        echo "$PUBKEY" >> /root/.ssh/authorized_keys || { echo "JOB-FAIL: key: cannot write /root/.ssh/authorized_keys"; return 1; }
+        echo "JOB-KEY: added"
+    fi
+    chmod 600 /root/.ssh/authorized_keys || { echo "JOB-FAIL: key: cannot set the mode of /root/.ssh/authorized_keys"; return 1; }
+}
+
+sshd_restart() {
+    systemctl restart ssh > /dev/null 2>&1 || systemctl restart sshd > /dev/null 2>&1 \
+        || service ssh restart > /dev/null 2>&1 || service sshd restart > /dev/null 2>&1
+}
+
+sshd_override() {
+    local effective key value file line
+    effective=$(sshd -T 2>/dev/null) || return 1
+    while read -r key value; do
+        grep -qix "${key} ${value}" <<< "$effective" && continue
+        for file in "$SSHD_DROPIN_DIR"/*.conf "$SSHD_CONFIG"; do
+            [ -f "$file" ] && [ "$file" != "$SSHD_DROPIN" ] || continue
+            line=$(grep -iE "^[[:space:]]*${key}[[:space:]]" "$file" 2>/dev/null | head -n 1 | tr -s '[:space:]' ' ')
+            line=${line# }
+            if [ -n "$line" ]; then
+                echo "${line% } in ${file}"
+                return 0
+            fi
+        done
+    done <<< "$SSHD_WANTED"
+    return 1
+}
+
+sshd_older_than_config() {
+    local pid unit started newest
+    for unit in ssh sshd; do
+        pid=$(systemctl show -p MainPID --value "${unit}.service" 2>/dev/null)
+        [[ $pid =~ ^[1-9][0-9]*$ ]] && break
+        pid=""
+    done
+    [ -n "$pid" ] || pid=$(pgrep -o -x sshd 2>/dev/null)
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 1
+    started=$(($(date +%s) - $(ps -o etimes= -p "$pid" 2>/dev/null || echo 0)))
+    newest=$(find "$SSHD_CONFIG" "$SSHD_DROPIN_DIR" -maxdepth 1 -printf '%T@\n' 2>/dev/null | sort -n | tail -n 1)
+    [ -n "$newest" ] && [ "${newest%.*}" -ge "$started" ]
+}
+
+step_sshd() {
+    local backup override updated
+    echo "JOB-STEP: sshd"
+    if sshd_effective_ok; then
+        if sshd_older_than_config; then
+            sshd_restart
+            echo "JOB-SSHD: reloaded"
+        else
+            echo "JOB-SSHD: correct"
+        fi
+        return 0
+    fi
+
+    if [ -d "$SSHD_DROPIN_DIR" ] && grep -qiE "^[[:space:]]*Include[[:space:]]+${SSHD_DROPIN_DIR}/" "$SSHD_CONFIG"; then
+        backup=""
+        [ -f "$SSHD_DROPIN" ] && backup=$(cat "$SSHD_DROPIN")
+        printf '%s\n' "$SSHD_WANTED" > "$SSHD_DROPIN"
+        if ! sshd -t 2>/dev/null; then
+            if [ -n "$backup" ]; then printf '%s\n' "$backup" > "$SSHD_DROPIN"; else rm -f "$SSHD_DROPIN"; fi
+            echo "JOB-FAIL: sshd: the new settings do not pass sshd -t"
+            return 1
+        fi
+    else
+        [ -f "${SSHD_CONFIG}.bak.tunnelcontrol" ] || cp -p "$SSHD_CONFIG" "${SSHD_CONFIG}.bak.tunnelcontrol"
+        backup=$(cat "$SSHD_CONFIG")
+        while read -r key _; do
+            sed -i "/^[[:space:]]*#*[[:space:]]*${key}[[:space:]]/Id" "$SSHD_CONFIG"
+        done <<< "$SSHD_WANTED"
+        if grep -qiE '^[[:space:]]*Match[[:space:]]' "$SSHD_CONFIG"; then
+            updated=$(WANTED="$SSHD_WANTED" awk '!done && tolower($0) ~ /^[[:space:]]*match[[:space:]]/ { print ENVIRON["WANTED"]; done = 1 } { print }' "$SSHD_CONFIG")
+            printf '%s\n' "$updated" > "$SSHD_CONFIG"
+        else
+            printf '%s\n' "$SSHD_WANTED" >> "$SSHD_CONFIG"
+        fi
+        if ! sshd -t 2>/dev/null; then
+            printf '%s\n' "$backup" > "$SSHD_CONFIG"
+            echo "JOB-FAIL: sshd: the new settings do not pass sshd -t"
+            return 1
+        fi
+    fi
+
+    if ! sshd_effective_ok; then
+        if override=$(sshd_override); then
+            echo "JOB-FAIL: sshd: ${override} overrides the settings of Tunnel Control; sshd is left running as it was"
+        else
+            echo "JOB-FAIL: sshd: the settings are written but sshd -T does not show them, another file of the sshd configuration overrides them; sshd is left running as it was"
+        fi
+        return 1
+    fi
+    sshd_restart
+    echo "JOB-SSHD: applied"
+}
+
+step_packages() {
+    local need=() missing_modules=() module name found waited=0 status
+    echo "JOB-STEP: packages"
+    command -v ip > /dev/null 2>&1 || need+=(iproute2)
+    command -v iptables > /dev/null 2>&1 || need+=(iptables)
+    { command -v sysctl && command -v pgrep; } > /dev/null 2>&1 || need+=(procps)
+    if command -v modprobe > /dev/null 2>&1; then
+        for module in tun xt_conntrack xt_multiport xt_REDIRECT:ipt_REDIRECT xt_MASQUERADE:ipt_MASQUERADE; do
+            found=0
+            for name in ${module//:/ }; do
+                modprobe -n -q "$name" > /dev/null 2>&1 && found=1 && break
+            done
+            [ "$found" -eq 1 ] || missing_modules+=("${module%%:*}")
+        done
+    else
+        need+=(kmod)
+    fi
+    if [ ${#need[@]} -eq 0 ] && [ ${#missing_modules[@]} -eq 0 ]; then
+        return 0
+    fi
+    [ ${#missing_modules[@]} -eq 0 ] || echo "JOB-MODULES: ${missing_modules[*]}"
+    if ! command -v apt-get > /dev/null 2>&1; then
+        echo "JOB-NOAPT: ${need[*]}${need[*]:+ }${missing_modules[*]:+kernel modules}"
+        return 0
+    fi
+
+    export DEBIAN_FRONTEND=noninteractive
+    while [ "$waited" -lt 300 ] && apt_lock_busy; do
+        sleep 5
+        waited=$((waited + 5))
+    done
+    if [ -n "$(ls -A /var/lib/dpkg/updates 2>/dev/null)" ] && ! apt_lock_busy; then
+        if dpkg --configure -a > /dev/null 2>&1; then
+            echo "JOB-DPKG: repaired"
+        else
+            echo "JOB-DPKG: failed"
+        fi
+    fi
+    apt-get -o DPkg::Lock::Timeout=300 -o APT::Status-Fd=3 update 3>&1 > /dev/null 2>&1
+    if [ ${#missing_modules[@]} -gt 0 ]; then
+        if dpkg-query -W -f='${Status}' "linux-modules-extra-$(uname -r)" 2>/dev/null | grep -q "install ok installed"; then
+            echo "JOB-NOMODULES: installed $(uname -r)"
+        elif apt-cache show "linux-modules-extra-$(uname -r)" > /dev/null 2>&1; then
+            need+=("linux-modules-extra-$(uname -r)")
+        else
+            echo "JOB-NOMODULES: absent $(uname -r)"
+        fi
+    fi
+    [ ${#need[@]} -gt 0 ] || return 0
+    echo "JOB-INSTALL: ${need[*]}"
+    apt-get -o DPkg::Lock::Timeout=300 -o APT::Status-Fd=3 install -y --no-install-recommends "${need[@]}" 3>&1 > /dev/null 2>&1
+    status=$?
+    [ -c /dev/net/tun ] || modprobe tun > /dev/null 2>&1
+    echo "JOB-INSTALLED: $status"
+}
+
+RESULT=0
+step_key || RESULT=1
+[ "$RESULT" -ne 0 ] || step_sshd || RESULT=1
+step_packages
+echo "JOB-DONE: $RESULT"

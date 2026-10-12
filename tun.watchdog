@@ -21,8 +21,8 @@ while true; do
         exit 0
     fi
 
-    if ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
-        LOG NOTICE "Tun daemon died unexpectedly. Restarting..."
+    if ! tr '\0' '\n' 2>/dev/null < "/proc/$(cat "$PID_FILE" 2>/dev/null)/cmdline" | grep -qx './tun.manager'; then
+        LOG WARN "Tun daemon died unexpectedly. Restarting..."
 
         nohup ./tun --restart >/dev/null 2>&1 &
         exit 0

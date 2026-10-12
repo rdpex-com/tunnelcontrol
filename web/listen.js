@@ -1,7 +1,8 @@
 import fs from 'fs';
 import path from 'path';
 import https from 'https';
-import { DATA_PATH } from './paths.js';
+import { execFile } from 'child_process';
+import { DATA_PATH, ROOT_DIR } from './paths.js';
 
 const USE_HTTPS = process.env.USE_HTTPS === 'true' || !process.env.USE_HTTPS;
 const HTTPS_PORT = parseInt(process.env.HTTPS_PORT) || 8443;
@@ -9,6 +10,7 @@ const CERT_CHECK_PORT = parseInt(process.env.CERT_CHECK_PORT) || HTTPS_PORT + 1;
 const CERT_DIR = path.join(DATA_PATH, 'cert');
 const HOST = process.env.HOST || '0.0.0.0';
 const PORT = parseInt(process.env.PORT) || 3000;
+const CERT_RENEW_INTERVAL = 24 * 60 * 60 * 1000;
 
 function startCertificateCheck(httpsOptions) {
     const server = https.createServer(httpsOptions, (req, res) => {
@@ -19,6 +21,25 @@ function startCertificateCheck(httpsOptions) {
     server.listen(CERT_CHECK_PORT, HOST, () => {
         console.log(`[HTTPS] Certificate check on https://${HOST}:${CERT_CHECK_PORT}`);
     });
+    return server;
+}
+
+function renewCertificateDaily(servers, keyPath, certPath) {
+    setInterval(() => {
+        execFile(path.join(ROOT_DIR, 'tun.web.cert'), ['expiry'], { cwd: ROOT_DIR, env: { ...process.env, DATA_PATH } }, (error) => {
+            if (error?.code !== 3) {
+                if (error) console.error(`[HTTPS] Certificate renewal check failed: ${error.message}`);
+                return;
+            }
+            try {
+                const options = { key: fs.readFileSync(keyPath), cert: fs.readFileSync(certPath) };
+                servers.forEach(server => server.setSecureContext(options));
+                console.log('[HTTPS] Site certificate renewed, the panel uses it now');
+            } catch (err) {
+                console.error(`[HTTPS] Cannot load the renewed site certificate: ${err.message}`);
+            }
+        });
+    }, CERT_RENEW_INTERVAL).unref();
 }
 
 export async function startServer(app) {
@@ -50,15 +71,15 @@ export async function startServer(app) {
 
     await app.ready();
 
-    https.createServer(httpsOptions, app.routing).listen(HTTPS_PORT, HOST, (err) => {
-        if (err) {
-            console.error('HTTPS Server error:', err);
-            process.exit(1);
-        }
+    const server = https.createServer(httpsOptions, app.routing);
+    server.on('error', (err) => {
+        console.error(`[HTTPS] Cannot listen on ${HOST}:${HTTPS_PORT}: ${err.message} (WEB_HTTPS_PORT in tun.config)`);
+        process.exit(1);
+    });
+    server.listen(HTTPS_PORT, HOST, () => {
         console.log(`🚀 HTTPS Web server running on https://${HOST}:${HTTPS_PORT}`);
     });
 
-    startCertificateCheck(httpsOptions);
-
-    await app.listen();
+    const checkServer = startCertificateCheck(httpsOptions);
+    renewCertificateDaily([server, checkServer], keyPath, certPath);
 }

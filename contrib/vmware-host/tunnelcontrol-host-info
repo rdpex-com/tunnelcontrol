@@ -8,7 +8,11 @@ SENSORS=(
 )
 
 if [[ "$1" == "once" || "$1" == "-1" || "$1" == "--once" ]]; then
-    cpu_load=$(top -bn1 | grep "^%Cpu" | awk '{print $2}')
+    read -r _ u1 n1 s1 i1 w1 q1 sq1 st1 _ < /proc/stat
+    sleep 0.5
+    read -r _ u2 n2 s2 i2 w2 q2 sq2 st2 _ < /proc/stat
+    cpu_load=$(awk -v busy=$(( (u2 + n2 + s2 + q2 + sq2 + st2) - (u1 + n1 + s1 + q1 + sq1 + st1) )) -v idle=$(( (i2 + w2) - (i1 + w1) )) \
+        'BEGIN { total = busy + idle; printf "%.1f", (total > 0 ? busy * 100 / total : 0) }')
     ram=$(free | awk '/^Mem:/ {
         used = $3;
         total = $2;

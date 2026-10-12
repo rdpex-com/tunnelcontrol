@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="theme-color" id="theme-color" content="#0a0f1c">
     <meta name="screen-orientation" content="portrait">
 
     <title>Tunnel Control Panel</title>
@@ -27,7 +28,6 @@
     <script src="js/app/platform-early.js"></script>
     <script src="js/app/recovery.js"></script>
     <script src="js/tailwind.min.js"></script>
-    <script src="js/htmx.min.js"></script>
     
     <script>
         const tabHashes = {
@@ -56,11 +56,13 @@
             
             if (theme === 'light') {
                 html.classList.add('light');
-                html.style.setProperty('color-scheme', 'light', 'important');
+                html.style.setProperty('color-scheme', 'light only', 'important');
             } else {
                 html.classList.add('dark');
                 html.style.setProperty('color-scheme', 'dark', 'important');
             }
+
+            document.getElementById('theme-color')?.setAttribute('content', theme === 'light' ? '#f3f4f6' : '#0a0f1c');
 
             // Force refresh for the Tailwind CDN
             void html.offsetWidth;
@@ -92,7 +94,7 @@
 
         // Manual switch
         window.toggleTheme = function(checkbox) {
-            newTheme = checkbox.checked ? 'dark' : 'light';
+            const newTheme = checkbox.checked ? 'dark' : 'light';
             localStorage.setItem('theme', newTheme);
             applyTheme(newTheme);
         }
@@ -101,12 +103,12 @@
     <link rel="stylesheet" href="css/fontawesome.min.css">    
     <link rel="stylesheet" href="css/style.css">
 
-    <link rel="icon" type="image/png" href="favicon.png">
+    <link rel="icon" href="img/favicon.ico" sizes="48x48">
+    <link rel="icon" href="img/icon-192.png" type="image/png" sizes="192x192">
+    <link rel="apple-touch-icon" href="img/apple-touch-icon.png">
 
     <link rel="manifest" href="manifest.json">
 
-    <meta name="theme-color" content="#f3f4f6" media="(prefers-color-scheme: light)">
-    <meta name="theme-color" content="#0a0f1c" media="(prefers-color-scheme: dark)">
     <meta name="color-scheme" content="light dark">
 
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
@@ -123,9 +125,11 @@
         <!-- Header -->
         <div class="flex justify-between items-start mb-8 border-b border-gray-200 dark:border-gray-800 pb-6" id="header-container">
             <div id="title-wrapper" style="display: contents;">
-                <div class="flex items-start gap-3">
-                    <img id="header-icon" src="img/imageR.png" alt="Tunnel" 
-                         class="w-9 h-9 drop-shadow-[0_0_0_2px_#60a5fa] drop-shadow-[0_0_3px_#60a5fa] drop-shadow-[0_0_12px_rgba(96,165,250,0.5)] md:hidden hidden">
+                <div class="flex items-center gap-3">
+                    <span>
+                        <img id="header-icon" src="img/mark-color.webp" alt="Tunnel" class="header-mark w-[58px] h-[58px] hidden dark:block">
+                        <img src="img/mark-mask.webp" alt="Tunnel" class="header-mark w-[58px] h-[58px] block dark:hidden">
+                    </span>
                     
                     <div class="pt-0.5">
                         <h1 id="main-title" class="text-3xl font-bold leading-none text-gray-900 dark:text-white">Tunnel Control™ Panel</h1>
@@ -149,10 +153,20 @@
                         <span id="debug-modules" class="font-medium"></span>
                     </span>
                 </strong>
-                <button onclick="window.clearDebug()" 
-                        class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
-                    Clear
-                </button>
+                <div class="flex gap-2">
+                    <button onclick="window.copyDebug(this)"
+                            class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
+                        Copy
+                    </button>
+                    <button onclick="window.clearDebug()"
+                            class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
+                        Clear
+                    </button>
+                    <button onclick="window.disableDebug()"
+                            class="text-xs bg-gray-200 dark:bg-gray-800 hover:bg-gray-300 dark:hover:bg-gray-700 px-3 py-1 rounded-lg">
+                        Hide
+                    </button>
+                </div>
             </div>            
             <pre id="debug-content" class="font-mono text-xs whitespace-pre-wrap max-h-96 overflow-auto"></pre>
         </div>

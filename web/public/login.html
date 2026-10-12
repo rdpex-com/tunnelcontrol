@@ -17,12 +17,14 @@
             const html = document.documentElement;
             html.classList.remove('dark', 'light');
             html.classList.add(theme);
-            html.style.setProperty('color-scheme', theme, 'important');
+            html.style.setProperty('color-scheme', theme === 'light' ? 'light only' : theme, 'important');
         })();
     </script>
 
     <link rel="stylesheet" href="css/fontawesome.min.css">
-    <link rel="icon" type="image/png" href="favicon.png">
+    <link rel="icon" href="img/favicon.ico" sizes="48x48">
+    <link rel="icon" href="img/icon-192.png" type="image/png" sizes="192x192">
+    <link rel="apple-touch-icon" href="img/apple-touch-icon.png">
     <link rel="manifest" href="manifest.json">
     <meta name="color-scheme" content="light dark">
 </head>
@@ -33,9 +35,9 @@
         <div id="login-message" class="hidden text-sm rounded-xl px-4 py-3"></div>
 
         <div id="cert-warning" class="hidden text-sm rounded-xl px-4 py-3 space-y-3 bg-yellow-100 text-yellow-900 dark:bg-yellow-900/40 dark:text-yellow-100">
-            <div class="font-medium">This device does not trust the panel certificate, so updates, push notifications and offline mode may not work.</div>
+            <div id="cert-text" class="font-medium">This device does not trust the panel certificate, so updates, push notifications and offline mode may not work.</div>
             <div id="cert-hint"></div>
-            <a href="/cert.pem" download="tun-panel.crt"
+            <a href="/cert.pem"
                class="block text-center bg-yellow-600 hover:bg-yellow-700 text-white px-4 py-2.5 rounded-2xl font-semibold">
                 Download Certificate
             </a>
@@ -63,6 +65,12 @@
 
         initDebugMode();
 
+        if ('caches' in window) {
+            caches.keys()
+                .then(keys => Promise.all(keys.filter(key => key.startsWith('tunnel-dynamic-')).map(key => caches.delete(key))))
+                .catch(e => logDebug('login cache error', e.message));
+        }
+
         checkCertificateTrust().then((result) => {
             logDebug(describeCertificateCheck(result));
             if (result.trusted === false) {
@@ -86,6 +94,9 @@
             try {
                 const res = await fetch('/api/auth/status', { cache: 'no-store' });
                 const data = await res.json();
+                if (data.push === false) {
+                    document.getElementById('cert-text').textContent = 'This device does not trust the panel certificate, so updates and offline mode may not work.';
+                }
                 if (!data.enabled || data.authenticated) {
                     location.replace('/');
                     return;
@@ -109,7 +120,7 @@
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
-                        login: document.getElementById('login-user').value,
+                        login: document.getElementById('login-user').value.trim(),
                         password: document.getElementById('login-password').value
                     })
                 });

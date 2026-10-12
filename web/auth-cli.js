@@ -7,7 +7,8 @@ const ROOT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..'
 const DATA_PATH = path.resolve(ROOT_DIR, process.env.DATA_PATH || 'data');
 const AUTH_FILE = path.join(DATA_PATH, 'web_auth.json');
 
-const [user, password] = fs.readFileSync(0, 'utf-8').split('\n');
+const [login, password] = fs.readFileSync(0, 'utf-8').split('\n');
+const user = (login || '').trim();
 
 if (!user || !password) {
     console.error('Login and password must not be empty');

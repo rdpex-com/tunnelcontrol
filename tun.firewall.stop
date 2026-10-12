@@ -1,0 +1,29 @@
+#!/bin/bash
+# tun.firewall.stop
+
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
+source ./tun.logger
+
+LOG INFO "Removing the rules of the tunnels; the base rules and policies stay"
+
+for table in filter nat mangle; do
+    iptables -t "$table" -S 2>/dev/null | grep -E -- '^-A .*(-i|-o) (tun|ifb)[0-9]+( |$)' | while IFS= read -r rule; do
+        read -ra args <<< "${rule/#-A /-D }"
+        iptables -t "$table" "${args[@]}" 2>/dev/null || true
+    done
+done
+
+while ip rule del priority 90 2>/dev/null; do :; done
+while ip rule del priority 91 2>/dev/null; do :; done
+
+for id in $(ip nexthop show 2>/dev/null | awk '$1 == "id" && $2 >= 3000 && $2 < 4000 {print $2}' | sort -n); do
+    ip nexthop del id "$id" 2>/dev/null || true
+done
+
+for dev in $(ip -o link show type ifb 2>/dev/null | grep -oE ': ifb[0-9]+' | cut -c3-); do
+    ip link del "$dev" 2>/dev/null || true
+done

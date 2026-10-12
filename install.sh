@@ -16,16 +16,31 @@ fail() {
     exit 1
 }
 
+apt_lock_busy() {
+    local lock
+    for lock in /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend; do
+        [ -e "$lock" ] && grep -q ":$(stat -c %i "$lock") " /proc/locks && return 0
+    done
+    return 1
+}
+
 apt_progress() {
     local label=$1 line pct verb eta status
     local eta_re='\(([^)]*remaining)\)'
     local -a field
     shift
+    if [ "${1:-}" = update ]; then
+        local waited=0
+        while [ "$waited" -lt 300 ] && apt_lock_busy; do
+            sleep 5
+            waited=$((waited + 5))
+        done
+    fi
     if [ ! -t 1 ]; then
-        DEBIAN_FRONTEND=noninteractive apt-get -qq "$@" > /dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get -qq -o DPkg::Lock::Timeout=300 "$@" > /dev/null 2>&1
         return
     fi
-    DEBIAN_FRONTEND=noninteractive apt-get -o APT::Status-Fd=3 "$@" 3>&1 > /dev/null 2>&1 | while IFS= read -r line; do
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -o APT::Status-Fd=3 "$@" 3>&1 > /dev/null 2>&1 | while IFS= read -r line; do
         IFS=: read -ra field <<< "$line"
         case "${field[0]:-}" in
             dlstatus) verb=Downloading; pct=${field[2]:-} ;;
@@ -43,6 +58,7 @@ apt_progress() {
 }
 
 [ "$(id -u)" -eq 0 ] || fail "run the installer as root"
+[[ $INSTALL_DIR != *[[:space:]]* ]] || fail "the install path must not contain spaces: ${INSTALL_DIR}"
 command -v apt-get > /dev/null 2>&1 || fail "only Debian and Ubuntu (apt) are supported"
 command -v systemctl > /dev/null 2>&1 || fail "systemd is required"
 
@@ -83,6 +99,7 @@ fi
 
 mkdir -p "${INSTALL_DIR}"
 cp -a "$TMP/src/." "${INSTALL_DIR}/"
+(cd "$TMP/src" && find . -type f -printf '%P\n' | LC_ALL=C sort) > "${INSTALL_DIR}/.release-files"
 ln -sfn "${INSTALL_DIR}/tun" /usr/local/bin/tun
 [ -e "${INSTALL_DIR}/tun.config" ] || cp "${INSTALL_DIR}/tun.config.example" "${INSTALL_DIR}/tun.config"
 

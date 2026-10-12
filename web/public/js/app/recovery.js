@@ -46,15 +46,46 @@ function showRecoveryBanner(message, subMessage = '') {
     }
 
     if (errorMessage) {
-        banner.innerHTML += `<span style="font-size:12px; opacity:0.7; margin-top:6px;">${errorMessage}</span>`;
+        const detail = document.createElement('span');
+        detail.style.cssText = 'font-size:12px; opacity:0.7; margin-top:6px;';
+        detail.textContent = errorMessage;
+        banner.appendChild(detail);
     }
 }
     
 window.__recoveryAttempted = false;
 
+const RECOVERY_WINDOW = 10 * 60 * 1000;
+
+function recoveryStart() {
+    const value = parseInt(new URL(window.location.href).searchParams.get('recovery_start'), 10);
+    return value > 0 ? value : 0;
+}
+
+function dropRecoveryStart() {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.has('recovery_start')) return;
+    url.searchParams.delete('recovery_start');
+    history.replaceState(history.state, '', url.toString());
+}
+
+window.addEventListener('load', () => {
+    setTimeout(() => {
+        if (!window.__recoveryAttempted) dropRecoveryStart();
+    }, 30000);
+});
+
 function forceUpdateAndReload() {
     if (window.__recoveryAttempted) return;
     window.__recoveryAttempted = true;
+
+    const start = recoveryStart();
+    if (start && Date.now() - start > RECOVERY_WINDOW) {
+        console.error('%c[RECOVERY] No recovery after 10 minutes, reloading stopped', 'color: red; font-weight: bold');
+        dropRecoveryStart();
+        showRecoveryBanner('Recovery failed for 10 minutes', 'Reload the page to try again');
+        return;
+    }
 
     console.error('%c[EMERGENCY RECOVERY] Critical error! Forcing SW update...', 
                 'color: red; font-weight: bold; font-size: 14px');
@@ -72,6 +103,7 @@ function reloadWithRecovery() {
     let next = current ? parseInt(current, 10) + 1 : 1;
 
     url.searchParams.set('recovery', next);
+    url.searchParams.set('recovery_start', recoveryStart() || Date.now());
     console.log(`%c[RECOVERY] Counter → ${next}`, 'color: orange');
 
     window.location.replace(url.toString());
@@ -188,6 +220,7 @@ window.addEventListener('error', (e) => {
     console.error('[Recovery] Global error caught:', errorString);
     
     if (shouldTriggerRecovery(errorString)) {
+        errorMessage = errorMessage || errorString;
         forceUpdateAndReload();
     }
 });
@@ -197,6 +230,7 @@ window.addEventListener('unhandledrejection', (e) => {
     console.error('[Recovery] Unhandled rejection:', errorString);
 
     if (shouldTriggerRecovery(errorString)) {
+        errorMessage = errorMessage || errorString;
         forceUpdateAndReload();
     }
 });

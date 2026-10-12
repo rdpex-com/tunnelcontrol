@@ -1,4 +1,5 @@
 import { exec } from 'child_process';
+import { tunnelsRunning, markRestart } from '../helpers.js';
 
 export default async function serviceRoutes(app) {
     app.post('/api/service', async (request) => {
@@ -9,8 +10,10 @@ export default async function serviceRoutes(app) {
                 return { success: false, error: 'Invalid action. Use start, stop or restart' };
             }
 
+            if (action !== 'stop') markRestart();
+
             return new Promise((resolve) => {
-                exec(`sudo systemctl ${action} tun`, (error) => {
+                exec(`systemctl ${action === 'stop' ? '' : '--no-block '}${action} tun`, (error) => {
                     if (error) {
                         resolve({ success: false, error: error.message, action });
                     } else {
@@ -25,13 +28,8 @@ export default async function serviceRoutes(app) {
 
     app.get('/api/service/status', async () => {
         try {
-            return new Promise((resolve) => {
-                exec('systemctl is-active tun', (error, stdout) => {
-                    const status = stdout.trim();
-                    const isActive = status === 'active';
-                    resolve({ success: true, status, isActive, isRunning: isActive });
-                });
-            });
+            const { unitState, unitActive, running } = await tunnelsRunning();
+            return { success: true, status: unitState, isActive: unitActive, isRunning: running };
         } catch (err) {
             return { success: false, error: err.message };
         }

@@ -1,7 +1,7 @@
 import fastify from 'fastify';
 import { ROOT_DIR, DATA_PATH } from './paths.js';
 import { createAuth } from './auth.js';
-import { startPush } from './push.js';
+import { startPush, pushOn } from './push.js';
 import { startServiceMonitor } from './monitor.js';
 import { startServer } from './listen.js';
 import staticRoutes from './routes/static.js';
@@ -32,10 +32,16 @@ if (process.env.NODE_ENV !== 'production') {
     console.log('[Dev] Global cache disabling enabled via onSend hook');
 }
 
+app.addHook('onSend', async (request, reply) => {
+    reply.header('X-Frame-Options', 'SAMEORIGIN');
+    reply.header('X-Content-Type-Options', 'nosniff');
+    reply.header('Referrer-Policy', 'no-referrer');
+});
+
 const auth = createAuth(ROOT_DIR, DATA_PATH);
 app.addHook('onRequest', auth.onRequest);
 
-app.get('/api/auth/status', async (request) => auth.status(request));
+app.get('/api/auth/status', async (request) => ({ ...auth.status(request), push: pushOn() }));
 app.post('/api/auth/login', async (request, reply) => auth.login(request, reply));
 app.post('/api/auth/logout', async (request, reply) => auth.logout(request, reply));
 

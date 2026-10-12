@@ -17,18 +17,18 @@ ln -sf "${WORKING_DIR}/tun" /usr/local/bin/tun 2>/dev/null || true
 
 if [ ! -f "$KEY_FILE" ]; then
     LOG INFO "Key not found, generation..."
-    ssh-keygen -q -t ed25519 -N "" -C "tun-tunnel" -f "$KEY_FILE"
+    ssh-keygen -q -t ed25519 -N "" -C "tun-tunnel" -f "$KEY_FILE" || { LOG ERROR "Failed to create the key ${KEY_FILE}"; exit 1; }
 fi
 
 LOG INFO "Installing service ${SERVICE_NAME}..."
 
 rm -f "${SYSTEMD_PATH}"
-sed "s|@DIR@|${WORKING_DIR}|g" "${SERVICE_FILE}" > "${SYSTEMD_PATH}"
+sed "s|@DIR@|${WORKING_DIR}|g" "${SERVICE_FILE}" > "${SYSTEMD_PATH}" || { LOG ERROR "Failed to write ${SYSTEMD_PATH}"; exit 1; }
 
-systemctl daemon-reload
-systemctl enable "${SERVICE_NAME}"
+systemctl daemon-reload || { LOG ERROR "systemctl daemon-reload failed"; exit 1; }
+systemctl enable "${SERVICE_NAME}" || { LOG ERROR "Failed to enable ${SERVICE_NAME}"; exit 1; }
 
-if [ -d /etc/logrotate.d ]; then
+if command -v logrotate > /dev/null 2>&1 && [ -d /etc/logrotate.d ]; then
     cat > /etc/logrotate.d/tun <<'EOF'
 /var/log/tun*.log {
     su root root
@@ -47,4 +47,4 @@ fi
 
 LOG NOTICE "Service ${SERVICE_NAME} installed and enabled."
 LOG INFO "Working directory: ${WORKING_DIR}"
-LOG INFO "To start manually: tun --stop && systemctl start ${SERVICE_NAME} or reboot the system."
+LOG INFO "To start: tun --start from the console, or as the service: systemctl restart ${SERVICE_NAME} (a stopped oneshot service can stay active), or reboot the system."

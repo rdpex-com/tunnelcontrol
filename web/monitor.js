@@ -1,22 +1,31 @@
-import { execPromise } from './helpers.js';
+import { managerAlive, restartPlanned } from './helpers.js';
 import { addToQueue } from './push.js';
 
-let lastServiceState = null;
+const DOWN_GRACE_MS = 30000;
+
+let firstCheck = true;
+let downSince = 0;
+let notified = false;
 
 async function checkServiceStatus() {
     try {
-        const { stdout } = await execPromise('systemctl is-active tun');
-        const currentState = stdout.trim();
+        const running = managerAlive();
+        const now = Date.now();
 
-        if (currentState === 'inactive' || currentState === 'failed') {
-            if (lastServiceState !== 'inactive') {
-                console.log(`[Monitor] Tunnel service is DOWN. Sending notification...`);
-                addToQueue("⚠️ Tunnel service is stopped or failed.\nPlease check the system.");
-                lastServiceState = 'inactive';
-            }
+        if (running || restartPlanned()) {
+            downSince = 0;
+            notified = false;
+        } else if (firstCheck) {
+            notified = true;
         } else {
-            lastServiceState = 'active';
+            if (!downSince) downSince = now;
+            if (!notified && now - downSince >= DOWN_GRACE_MS) {
+                console.log(`[Monitor] Tunnels are not running for ${DOWN_GRACE_MS / 1000} s. Sending notification...`);
+                addToQueue("⚠️ Tunnel service is stopped or failed.\nPlease check the system.");
+                notified = true;
+            }
         }
+        firstCheck = false;
     } catch (err) {
         console.error('[Monitor] Service check failed:', err.message);
     }

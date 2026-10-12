@@ -2,10 +2,20 @@
 # tun.update
 
 {
+if [ -z "${DATA_PATH}" ]; then
+    echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
+    exit 1
+fi
+
 cd "$(dirname "$(readlink -f "$0")")" || exit 1
 
 source ./tun.logger
 source ./tun.env
+
+MANAGER_PID=$(cat "${DATA_PATH}/tun_pid" 2>/dev/null)
+if [[ $MANAGER_PID =~ ^[0-9]+$ ]] && tr '\0' '\n' 2>/dev/null < "/proc/${MANAGER_PID}/cmdline" | grep -qx './tun.manager'; then
+    export TUN_UPDATE_WAS_RUNNING=1
+fi
 
 fail() {
     LOG ERROR "Update: $*"
@@ -29,6 +39,7 @@ if [ -d .git ]; then
     FROM=$(git log -1 --format=%h)
     TO=$(git log -1 --format=%h "$UPSTREAM")
 
+    date +%s > "${DATA_PATH}/tun_restarting"
     ./tun --stop < /dev/null > /dev/null 2>&1
 
     git merge --ff-only --quiet "$UPSTREAM" || fail "git merge failed; run tun --install to start the tunnels again"
@@ -63,12 +74,32 @@ else
         [ -e "$TMP/src/$USER_FILE" ] && fail "the archive contains the user item ${USER_FILE}"
     done
 
+    (cd "$TMP/src" && find . -type f -printf '%P\n' | LC_ALL=C sort) > "$TMP/release-files"
+
+    date +%s > "${DATA_PATH}/tun_restarting"
     ./tun --stop < /dev/null > /dev/null 2>&1
 
     cp -a "$TMP/src/." ./ || fail "copying the new code failed; run tun --install to start the tunnels again"
+
+    if [ -f .release-files ]; then
+        REMOVED=0
+        while IFS= read -r OLD_FILE; do
+            case $OLD_FILE in
+                ""|/*|*..*|tun.config|.data_path|data/*|bak/*|tun.server.setup.[0-9]*) continue ;;
+            esac
+            [ -e "$TMP/src/$OLD_FILE" ] && continue
+            if [ -f "$OLD_FILE" ]; then
+                rm -f -- "$OLD_FILE" && REMOVED=$((REMOVED + 1))
+                rmdir -p --ignore-fail-on-non-empty "$(dirname "$OLD_FILE")" 2>/dev/null || true
+            fi
+        done < <(LC_ALL=C comm -23 <(LC_ALL=C sort .release-files) "$TMP/release-files")
+        [ "$REMOVED" -gt 0 ] && LOG NOTICE "Update: removed ${REMOVED} file(s) that left the release"
+    fi
+    cp "$TMP/release-files" .release-files
     rm -rf "$TMP"
     LOG NOTICE "Update: code updated ${CURRENT:-unknown} -> ${LATEST}"
 fi
 
+export TUN_UPDATE=1
 exec ./tun --install
 }

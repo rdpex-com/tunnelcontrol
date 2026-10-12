@@ -1,0 +1,56 @@
+#!/bin/bash
+# tun.server.setup.vps
+
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+    echo "Error: this script runs on the VPS through tun.server.setup. Do not run this script directly."
+    exit 1
+fi
+
+set +e
+
+RUN_DIR="/run/tunnelcontrol"
+SESSION_FILE="${RUN_DIR}/session"
+JOB="${RUN_DIR}/setup.job"
+JOB_PID="${RUN_DIR}/setup.pid"
+JOB_LOG="${RUN_DIR}/setup.log"
+
+job_running() {
+    local pid
+    pid=$(cat "$JOB_PID" 2>/dev/null)
+    [[ $pid =~ ^[0-9]+$ ]] || return 1
+    tr '\0' ' ' 2>/dev/null < "/proc/${pid}/cmdline" | grep -q "^bash ${JOB} "
+}
+
+job_is_ours() {
+    local pid
+    pid=$(cat "$JOB_PID" 2>/dev/null)
+    [[ $pid =~ ^[0-9]+$ ]] || return 1
+    [ "$(tr '\0' '\n' 2>/dev/null < "/proc/${pid}/cmdline" | sed -n 3p)" = "$PUBKEY" ]
+}
+
+mkdir -p "$RUN_DIR"
+exec 9> "${RUN_DIR}/claim.lock"
+flock 9
+
+owner=$(cat "$SESSION_FILE" 2>/dev/null)
+if [ -n "$owner" ] && [ "$owner" != "$SESSION" ]; then
+    if compgen -G "/sys/class/net/tun[0-9]*" > /dev/null || { job_running && ! job_is_ours; }; then
+        echo "VPS-BUSY: $(date -r "$SESSION_FILE" "+%Y-%m-%d %H:%M:%S %Z" 2>/dev/null)|$(echo "$owner" | cut -c1-8)"
+        exit 0
+    fi
+    job_running || rm -f "$JOB_PID" "$JOB_LOG"
+fi
+echo "$SESSION" > "$SESSION_FILE"
+
+if job_running; then
+    echo "JOB-ATTACH: a setup started earlier is still running"
+else
+    cat > "$JOB"
+    : > "$JOB_LOG"
+    setsid nohup bash "$JOB" "$PUBKEY" > "$JOB_LOG" 2>&1 < /dev/null 9>&- &
+    echo $! > "$JOB_PID"
+fi
+
+flock -u 9
+exec 9>&-
+tail -n +1 -f --pid="$(cat "$JOB_PID")" "$JOB_LOG" 2>/dev/null

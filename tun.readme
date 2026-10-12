@@ -1,9 +1,11 @@
 Installation (Debian or Ubuntu with systemd, as root)
 
 Use a clean server and clean VPS hosts that run nothing else: tun reconfigures them completely. On the server
-it resets iptables on every start, takes over the routing tables 50, 51, 100, 200 and 300, turns on IP forwarding
-and turns off IPv6; on every VPS it changes sshd_config, adds its key for root, turns on IP forwarding and resets
-iptables (see VPS below).
+it resets iptables on every start, takes over the routing tables 50, 51, 100, 101 and up (one per channel), 200
+and 300, the rule priorities 50, 51, 90, 91, 100, 101 and 200 and the nexthop ids 3000-3999, turns on IP forwarding and turns off IPv6; on every VPS it changes sshd_config, adds its key for root, turns on IP forwarding, turns off IPv6 and resets
+iptables (see VPS below). After installation the network is configured so that the traffic of the local network
+never goes out directly again, only through the tunnels: while they are stopped, the clients have no internet,
+not even ping. The VPS hosts cannot open connections into the local network.
 
 curl -fsSL https://tunnelcontrol.app/install.sh | bash
                     # installs the latest release from GitHub into /opt/tunnelcontrol and creates tun.config
@@ -16,7 +18,8 @@ WEB_PANEL=0         # in tun.config before tun --install: console only, without 
 
 Commands
 
-tun --install       # installation and initialization: dependencies (with the web panel also Node.js 20+ and its packages),
+tun --install       # installation and initialization: dependencies (with the web panel also Node.js 20+ and its packages,
+                    # installed again only when package-lock.json or the Node.js version changed),
                     # services, first VPS setup (asks for the VPS password); without tun.config it creates one from
                     # the example and stops. Running it again is safe: the config and data are not touched
 tun --start         # start the tunnels
@@ -24,9 +27,15 @@ tun --restart       # restart the tunnels
 tun --stop          # graceful stop of the tunnels
 tun --kill          # immediate stop of the tunnels
 tun --web-password  # set the web panel login and password (signs out every panel session)
+tun --web-cert      # new panel certificate authority and site certificate; install the new certificate on
+                    # every device again (Download Certificate in the panel)
 tun --update        # update: from git (git pull) or, when installed with install.sh, from GitHub: compares VERSION
-                    # and downloads the archive (UPDATE_URL) only for a newer version, then runs tun --install;
-                    # only the code is replaced, tun.config, tun.server.setup.*, data and bak/ are not touched
+                    # and downloads the archive (UPDATE_URL) when the latest release differs from the installed version, then runs tun --install
+                    # without questions (no e-mail, no root password: a VPS that needs its first setup is held off
+                    # until tun --install is run by hand);
+                    # only the code is replaced, tun.config, tun.server.setup.<VPS IP>, data and bak/ are not touched;
+                    # an archive install keeps the list of release files in .release-files, and an update
+                    # removes the files that left the release (from git, git itself does that)
 tun --version       # installed version
 tun --help          # this list of commands; tun without a command or with an unknown one prints it too
 tun --status        # whether the tunnels run from the console or as the tun service, the service, the web panel,
@@ -35,8 +44,10 @@ tun --status        # whether the tunnels run from the console or as the tun ser
 tun --monitor [N]   # the same, redrawn every N seconds (3 by default); keys: 1-9 turn the host with that number
                     # on or off (as tun --toggle), q quits
 tun --toggle <IP>   # turn a host on or off, like its switch in Active Tunnels of the web panel: the tunnels of a
-                    # turned off host leave the routing and the rotation; the last active host cannot be turned
-                    # off; holds until the tunnels restart; without an address lists the hosts with their state
+                    # turned off host leave the routing and keep rotating as usual; a host cannot be turned off
+                    # while it is the only one with working tunnels or the last enabled one, a host whose
+                    # tunnels are all down can; holds until the tunnels restart; without an address lists the
+                    # hosts with their state
 
 
 Settings
@@ -45,32 +56,55 @@ tun.config          # your config, created from tun.config.example; never overwr
                     # tun does not start while it is identical to the example
 tun.defaults        # default values of all settings with descriptions; do not edit it —
                     # to change a setting, add a line with it to tun.config, for example ROTATION_DELAY=30
-tun.config.check    # config check; tun does not start if the config has anything but settings
+tun.config.check    # config check; tun does not start if the config has anything but settings or a value that
+                    # does not fit its setting (address, port, range, interface name, number, unit), a
+                    # setting given twice, or no CONFIG or no channel in TUNNELS; it names
+                    # the line and what is wrong; the panel runs the same check before saving
+                    # and while you type, highlighting the rejected lines
+Values in tun.config may be in double quotes, in single quotes or without quotes ("eth0:192.168.0.0/16",
+'eth0:192.168.0.0/16' and eth0:192.168.0.0/16 are the same); a value with a space, ; or & needs quotes.
 
+Channel N uses the addresses 10.N.N.1 (server) and 10.N.N.2 (VPS), so a local network in 10.0.0.0/8 must not
+overlap them; 192.168.0.0/16 and 172.16.0.0/12 are safe. This is not checked.
 TUNNELS in tun.config has one line per channel. Three lines per VPS are recommended for the smoothest
 rotation: it reconnects one channel at a time, and the other channels of that VPS carry its traffic meanwhile.
+TUNNEL_ROUTING      # how the client route through the tunnels is kept: group = a resilient nexthop group, where
+                    # the kernel drops a fallen channel at once and leaves the connections of the other channels
+                    # where they are; route = one multipath route, rebuilt when a channel falls; auto (default) =
+                    # group when the kernel supports it (checked at every start), otherwise route
+TUNNEL_KILL_MODE    # how a live channel is closed on rotation, stop or a lost tunN: local (default) = ssh -O exit
+                    # from this server; remote = first kill -9 the sshd of the channel on the VPS through the
+                    # session, then ssh -O exit
 DATA_PATH in tun.config is the data folder; when the path changes, the data moves on the next start.
-Web panel settings are WEB_* in tun.defaults: address and ports, HTTPS, e-mail for push notifications,
-certificate address and validity. Override them in tun.config, they apply when the panel restarts:
-systemctl restart tun-web (certificate address and validity only when the certificate is created;
-WEB_AUTH and WEB_PUSH_EMAIL at once, without a restart).
+Web panel settings are WEB_* in tun.defaults: login, address and ports, HTTPS, push notifications,
+certificate address and validity, the folder for the copies of tun.config made before each save
+(WEB_CONFIG_BACKUP_PATH: bak by default, /run/tunnelcontrol/bak keeps them in memory, empty keeps none).
+A change in tun.config applies when the tunnels start or restart (tun --restart or Restart in the panel).
+When a WEB_* setting or LOG_LEVEL differs from what the panel started with, the panel restarts with them;
+the site certificate of the panel is issued again when its address (WEB_CERT_ADDRESS, or the IP of the CONFIG
+interface) or WEB_CERT_SITE_DAYS changed (a warning in the log; the devices keep trusting it). WEB_CERT_DAYS, the validity of the authority installed on the
+devices, applies on tun --web-cert; WEB_PANEL on tun --install.
 
 
 Logs
 
 LOG_LEVEL=1         # in tun.config: 0 = errors and warnings; 1 (default) = plus key events: install, start and
-                    # stop, VPS setup, update; 2 = plus all other messages; 3 = plus debug messages; applies
-                    # when the tunnels restart (tun --restart), the panel request log on systemctl restart tun-web
-/var/log/tun.log    # errors, warnings and key events at every level
+                    # stop, VPS setup, update; 2 = plus all other messages; 3 = plus debug messages
+/var/log/tun.log    # errors and warnings at every level, key events from LOG_LEVEL=1
 /var/log/tun.verbose.log   # every message, from LOG_LEVEL=2
-/var/log/tun.mon.*.log     # traffic monitor logs from LOG_LEVEL=2, its debug log from LOG_LEVEL=3
+/var/log/tun.mon.total.log # total traffic every 10 seconds, from LOG_LEVEL=2; the events of the traffic
+                           # monitor are in tun.log and tun.verbose.log
+/var/log/tun.mon.verbose.log, tun.mon.debug.log   # traffic accounting details, from LOG_LEVEL=3
 /var/log/tun.web.log       # web panel log; its request log from LOG_LEVEL=3
 /etc/logrotate.d/tun       # added by tun --install: a log over 10 MB is rotated at the daily logrotate run,
                            # two compressed copies are kept
 LOG_VPS_FILE        # log file on every VPS, /var/log/tun.log by default; LOG_VPS_FILE="/tmp/tun.log" leaves
-                    # nothing behind after a VPS reboot; applies on the next VPS setup, for example tun --restart
-The Logs tab of the web panel lists the main log and the other log files that exist. After the level is lowered,
-it also warns how much the logs of the higher level take in /var/log, until they are deleted.
+                    # nothing behind after a VPS reboot
+LOG_VPS_MAX_KB      # each setup of a VPS (start, restart, recovery) trims its log when it is larger than this
+                    # many KB, keeping the last half; 1024 by default, 0 = never trim
+The Logs tab of the web panel lists the main log and the other log files that exist, except the panel's own
+tun.web.log (at level 3 reading it would keep adding to it). After the level is lowered, it also warns how much
+the logs of the higher level take in /var/log, until they are deleted.
 
 
 VPS
@@ -78,14 +112,48 @@ VPS
 The VPS must be clean: tun manages its firewall. On every VPS setup (tunnel start, setup of a VPS
 that went down) iptables is reset and incoming connections are closed except ping, SSH on ports 22
 and PORT, and the PORT_RANGE range for the local server (PORT and PORT_RANGE come from TUNNELS).
+tun keeps its VPS script and marks in /run/tunnelcontrol on the VPS: in memory, gone after a VPS reboot,
+and set up again with the VPS.
 
 A VPS serves one local server at a time. The server keeps a random session mark until it reboots
-(/run/tunnelcontrol/session, copied to data/tun_session), and the VPS setup records it in /tmp/tun_busy on the
-VPS. Another server, or a copy of this one, that tries to set up the VPS while its tunnels are up is refused
-and touches nothing there. It marks that VPS busy (data/tun_host_<VPS IP>_busy), logs it, sends one push
-notification and leaves the VPS out until the tunnels are restarted (tun --start, --restart, --install): no
-retries, no rotation counting it, and its tunnels are not listed in tun --status or in the panel. The VPS becomes free when the tunnels of its server are
-gone or the VPS reboots.
+(/run/tunnelcontrol/session, copied to data/tun_session), and the first connection of a VPS setup records it in
+/run/tunnelcontrol/session on the VPS. Another server, or a copy of this one, that tries to set up the VPS while its
+tunnels are up or its setup job runs is refused and touches nothing there; a setup job this server started before
+its own reboot (same key, new mark) is taken over and waited for instead. The VPS becomes free when the tunnels and
+the setup job of its server are gone or the VPS reboots.
+The refusal names the first eight characters of the mark of the server that holds the VPS; every server logs
+its own as "Session mark: ..." at the tunnel start, so the logs show which server it is. The push notification
+leaves the mark out. A VPS that answers busy is asked once more after a minute before it is held off: after a
+crash of this server (power loss, hard reset) its own old sessions stay on the VPS for up to 30 seconds under the
+mark of the previous boot. Every VPS is set up on its own, so this wait, an unreachable VPS or a package install on
+one VPS does not hold back the tunnels of the others; tun --start returns once every VPS has been tried (Ctrl-C
+returns at once and leaves the setups running in the background). A setup
+that takes longer than MANAGER_SETUP_TIMEOUT (900 seconds) is stopped and retried like any other failure.
+
+Every VPS setup runs one job on the VPS, /run/tunnelcontrol/setup.job, apart from the ssh session: it installs the key
+of this server, the sshd settings (keepalive, PermitTunnel; in /etc/ssh/sshd_config.d/00-tunnelcontrol.conf when
+sshd_config includes that folder, otherwise in sshd_config, and checked with sshd -T; sshd is restarted only when
+the check passes, and again when its configuration files changed after it started) and the missing packages and
+kernel modules (apt: iproute2, iptables, procps, kmod, linux-modules-extra for the running kernel), showing the
+progress. Each step is written to /run/tunnelcontrol/setup.log. When the link breaks, the job goes on; the next
+attempt waits for it; a job that has ended runs again, so a VPS fixed after a failed step is set up again
+on the next tunnel restart. When everything is in place the job takes seconds, so it runs at every setup. The setup
+connects with the key of this server; a VPS that refuses the key needs the root password, which only
+tun --install asks for (data/tun_host_<VPS IP>_configured marks a VPS that has taken the key).
+
+A VPS used by another server, one that needs its first setup when no password was entered, one that rejects the
+entered root password or does not let root log in with a password at all (PermitRootLogin prohibit-password,
+PasswordAuthentication no; allow it once or put the key of this server there by hand), or one that lacks what
+tunnels need, is held off: its
+mark data/tun_host_<VPS IP>_held holds the reason (busy, setup, password or vps) on the first line and the message on the
+second, the same message goes to the log and as one push notification, and the VPS is left out until
+the tunnels are restarted (tun --start, --restart, --install): no retries, no rotation counting it, and its
+tunnels are not listed in tun --status or in the panel.
+After the setup job the VPS checks itself. Without /dev/net/tun, a tun interface, PermitTunnel, ip_forward, the NAT or
+REDIRECT rule, the IN_IFACE interface (and OUT_IFACE with a PUBLIC_IP), or the ip, iptables or sysctl command, tunnels cannot work there: the VPS is held off with the
+reasons in the message. Lesser problems (no conntrack or multiport rule, no pgrep or systemd-run) are only logged.
+The root password entered in tun --install stays in memory only while a VPS still waits for its first
+setup; once every VPS is set up or held off, it is cleared.
 
 tun.server.setup.<VPS IP>   # optional file with your own commands for this VPS: open a port, an allow list,
                             # start your own scripts; runs as root on the VPS after the base firewall rules
@@ -98,14 +166,41 @@ Web panel
 
 https://<server address>:8443
 WEB_AUTH=1          # login with user and password (default); WEB_AUTH=0 in tun.config = no login
+WEB_PUSH=0          # in tun.config: no push notifications; the panel does not create or load its keys, offers no
+                    # button and drops the queued messages, tun --install does not ask for the e-mail
+WEB_APP_NAME        # the panel installed as an app is named "Tunnel Control <WEB_APP_NAME>"; tun --install
+                    # writes the host name of the server here, empty = the host name; up to 48 characters,
+                    # without / : * ? < > |; servers need
+                    # different names, or Chrome on Windows shows the notifications of the second app as
+                    # its own
+WEB_PUSH_LOGOUT_UNSUBSCRIBE=1   # in tun.config: Log Out in the panel also unsubscribes that device from push;
+                    # by default a device keeps getting the notifications after Log Out
 WEB_PUSH_EMAIL      # e-mail for push notifications; tun --install asks for it while it is the default
                     # root@localhost; Apple devices (iPhone, iPad, Safari on Mac) need a real address;
-                    # change it in tun.config at any time, the panel uses it at once, devices stay subscribed
-https://<server address>:8443/cert.pem   # panel certificate to install on a phone or a PC
-?debug=1 / ?debug=0 in the panel address # turn debug mode on / off (remembered in the browser)
+                    # after a change the devices stay subscribed
+Enable Push Notifications   # button on the System tab in every browser that supports push, until this
+                            # browser is subscribed (on iPhone and iPad only in the panel added to the home screen);
+                            # Android and Chrome on a computer are asked for permission when the panel opens,
+                            # Safari, Firefox and Edge after the click; when the browser blocks notifications for
+                            # the panel, the button stays and its click says how to allow them
+RUNNING / STOPPED           # panel header: the tunnel manager runs (data/tun_pid) as the tun service or from the
+                            # console, also with its hosts held off or in setup; when it has not been running for
+                            # 30 seconds, one push notification (a stop sends it; a restart
+                            # by tun --restart, --install, --update or the panel buttons and the start of the panel
+                            # send none)
+https://<server address>:8443/cert.pem   # certificate of the panel's own certificate authority, to install on a
+                                         # phone or a PC; it issues the site certificate of the panel, which
+                                         # the panel renews by itself before it ends, also while the tunnels
+                                         # run (WEB_CERT_SITE_DAYS), without a new install on the
+                                         # devices. A panel installed before has one self-signed certificate
+                                         # that Firefox rejects: tun --web-cert replaces it. On Windows into
+                                         # Trusted Root Certification Authorities of the Local Machine, the
+                                         # only store Firefox reads; the panel shows the steps per device
+?debug=1 / ?debug=0 in the panel address # turn debug mode on / off (remembered in the browser; Hide in the
+                                         # debug log turns it off)
 
 
 License
 
-GNU GPL v3.0, text in LICENSE. Third-party files of the web panel (Chart.js, htmx, Tailwind CSS,
+GNU GPL v3.0, text in LICENSE. Third-party files of the web panel (Chart.js, Tailwind CSS,
 Font Awesome) are under their own licenses, listed in THIRD-PARTY-NOTICES.

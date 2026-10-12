@@ -13,6 +13,7 @@ USE_HTTPS="false"
 [ "${WEB_HTTPS}" = "1" ] && USE_HTTPS="true"
 
 export DATA_PATH="${DATA_PATH:-./data}"
+printf '%s\n' "${TUN_WEB_SETTINGS[@]}" | sha256sum | awk '{print $1}' > "${DATA_PATH}/web_settings_hash" 2>/dev/null || true
 export NODE_ENV=production
 export HOST="${WEB_LISTEN}"
 export PORT="${WEB_HTTP_PORT}"

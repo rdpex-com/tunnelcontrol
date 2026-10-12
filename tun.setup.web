@@ -18,16 +18,35 @@ NODE_INSTALL_MAJOR=22
 source ./tun.logger
 source ./tun.env
 
+apt_lock_busy() {
+    local lock
+    for lock in /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend; do
+        [ -e "$lock" ] && grep -q ":$(stat -c %i "$lock") " /proc/locks && return 0
+    done
+    return 1
+}
+
 apt_progress() {
-    local label=$1 line pct verb eta status
+    local label=$1 line pct verb eta status log
     local eta_re='\(([^)]*remaining)\)'
     local -a field
     shift
-    if [ ! -t 1 ]; then
-        DEBIAN_FRONTEND=noninteractive apt-get -qq "$@" > /dev/null 2>&1
-        return
+    if [ "${1:-}" = update ]; then
+        local waited=0
+        while [ "$waited" -lt 300 ] && apt_lock_busy; do
+            sleep 5
+            waited=$((waited + 5))
+        done
     fi
-    DEBIAN_FRONTEND=noninteractive apt-get -o APT::Status-Fd=3 "$@" 3>&1 > /dev/null 2>&1 | while IFS= read -r line; do
+    log=$(mktemp)
+    if [ ! -t 1 ]; then
+        DEBIAN_FRONTEND=noninteractive apt-get -qq -o DPkg::Lock::Timeout=300 "$@" > "$log" 2>&1
+        status=$?
+        APT_OUTPUT=$(tail -n 5 "$log")
+        rm -f "$log"
+        return "$status"
+    fi
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -o APT::Status-Fd=3 "$@" 3>&1 > "$log" 2>&1 | while IFS= read -r line; do
         IFS=: read -ra field <<< "$line"
         case "${field[0]:-}" in
             dlstatus) verb=Downloading; pct=${field[2]:-} ;;
@@ -41,11 +60,19 @@ apt_progress() {
     done
     status=${PIPESTATUS[0]}
     printf '\r\033[K'
+    APT_OUTPUT=$(tail -n 5 "$log")
+    rm -f "$log"
     return "$status"
 }
 
 apt_install() {
-    apt_progress "package lists" update && apt_progress "$*" install -y "$@"
+    if ! apt_progress "package lists" update; then
+        LOG WARN "apt-get update failed, installing with the current package lists: ${APT_OUTPUT}"
+    fi
+    if ! apt_progress "$*" install -y "$@"; then
+        LOG ERROR "apt-get install $* failed: ${APT_OUTPUT}"
+        return 1
+    fi
 }
 
 npm_install() {
@@ -96,41 +123,39 @@ if [ "${NODE_MAJOR:-0}" -lt "${NODE_MIN_MAJOR}" ]; then
     fi
 fi
 
+if ! command -v npm > /dev/null 2>&1 && ! apt_install npm; then
+    LOG ERROR "Failed to install npm"
+    exit 1
+fi
+
 if ! command -v openssl > /dev/null 2>&1 && ! apt_install openssl; then
     LOG ERROR "Failed to install openssl"
     exit 1
 fi
 
-LOG NOTICE "Installing web panel packages (Node.js $(node -v))..."
-if ! npm_install; then
-    LOG ERROR "npm ci failed: $(echo "${NPM_OUTPUT}" | tail -n 5)"
-    exit 1
-fi
-
-if [ ! -f "${CERT_PATH}/privkey.pem" ] || [ ! -f "${CERT_PATH}/fullchain.pem" ]; then
-    CERT_ADDRESS="${WEB_CERT_ADDRESS}"
-    if [ -z "${CERT_ADDRESS}" ]; then
-        IFACE=$(sed -n 's/^[[:space:]]*CONFIG="\([^:"]*\):.*/\1/p' ./tun.config | tail -n 1)
-        CERT_ADDRESS=$(ip -4 -o addr show dev "${IFACE}" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -n 1)
-    fi
-    if [ -z "${CERT_ADDRESS}" ]; then
-        LOG ERROR "Cannot determine the web panel address for its certificate: set WEB_CERT_ADDRESS in tun.config"
+NPM_STAMP="${WORKING_DIR}/web/node_modules/.tunnelcontrol-installed"
+NPM_WANTED="$(sha256sum "${WORKING_DIR}/web/package-lock.json" | cut -d' ' -f1) $(node -v)"
+if [ -d "${WORKING_DIR}/web/node_modules" ] && [ "$(cat "$NPM_STAMP" 2>/dev/null)" = "$NPM_WANTED" ]; then
+    LOG INFO "Web panel packages are up to date (Node.js $(node -v))"
+else
+    LOG NOTICE "Installing web panel packages (Node.js $(node -v))..."
+    if ! npm_install; then
+        LOG ERROR "npm ci failed: $(echo "${NPM_OUTPUT}" | tail -n 5)"
         exit 1
     fi
+    echo "$NPM_WANTED" > "$NPM_STAMP"
+fi
 
-    if [[ ${CERT_ADDRESS} =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        CERT_NAMES="DNS:${CERT_ADDRESS},IP:${CERT_ADDRESS}"
+if [ ! -f "${CERT_PATH}/ca.key" ] && [ -f "${CERT_PATH}/privkey.pem" ] && [ -f "${CERT_PATH}/fullchain.pem" ]; then
+    LOG NOTICE "The web panel keeps its single self-signed certificate, which Firefox does not accept; tun --web-cert replaces it with a certificate authority and a site certificate (install the new certificate on the devices again)"
+else
+    if [ -f "${CERT_PATH}/ca.key" ]; then
+        ./tun.web.cert renew
     else
-        CERT_NAMES="DNS:${CERT_ADDRESS}"
+        ./tun.web.cert create
     fi
-
-    LOG NOTICE "Creating the web panel certificate for ${CERT_ADDRESS}..."
-
-    [ -d "${CERT_PATH}" ] || { mkdir -p "$(dirname "${CERT_PATH}")" && mkdir -m 700 "${CERT_PATH}"; }
-    if ! OPENSSL_OUTPUT=$(openssl req -x509 -nodes -days "${WEB_CERT_DAYS}" -newkey rsa:2048 \
-            -keyout "${CERT_PATH}/privkey.pem" -out "${CERT_PATH}/fullchain.pem" \
-            -subj "/CN=${CERT_ADDRESS}" -addext "subjectAltName = ${CERT_NAMES}" 2>&1); then
-        LOG ERROR "Creating the web panel certificate failed: ${OPENSSL_OUTPUT}"
+    CERT_RESULT=$?
+    if [ "$CERT_RESULT" -ne 0 ] && [ "$CERT_RESULT" -ne 3 ]; then
         exit 1
     fi
 fi
@@ -138,11 +163,11 @@ fi
 LOG INFO "Installing service ${SERVICE_NAME}..."
 
 rm -f "${SYSTEMD_PATH}"
-sed "s|@DIR@|${WORKING_DIR}|g" "${SERVICE_FILE}" > "${SYSTEMD_PATH}"
+sed "s|@DIR@|${WORKING_DIR}|g" "${SERVICE_FILE}" > "${SYSTEMD_PATH}" || { LOG ERROR "Failed to write ${SYSTEMD_PATH}"; exit 1; }
 
-systemctl daemon-reload
-systemctl enable "${SERVICE_NAME}"
-systemctl restart "${SERVICE_NAME}"
+systemctl daemon-reload || { LOG ERROR "systemctl daemon-reload failed"; exit 1; }
+systemctl enable "${SERVICE_NAME}" || { LOG ERROR "Failed to enable ${SERVICE_NAME}"; exit 1; }
+systemctl restart "${SERVICE_NAME}" || { LOG ERROR "Failed to start ${SERVICE_NAME}"; exit 1; }
 
 LOG NOTICE "Service ${SERVICE_NAME} installed, enabled and started."
 LOG INFO "Working directory: ${WORKING_DIR}"

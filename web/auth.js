@@ -74,7 +74,7 @@ export function createAuth(rootDir, dataPath) {
         }, 1000);
     }
 
-    function enabled() {
+    function readEnabled() {
         let value = '1';
         for (const file of ['tun.defaults', 'tun.config']) {
             try {
@@ -87,6 +87,8 @@ export function createAuth(rootDir, dataPath) {
         }
         return value !== '0';
     }
+
+    const authOn = readEnabled();
 
     function readCredentials() {
         try {
@@ -124,10 +126,10 @@ export function createAuth(rootDir, dataPath) {
     }
 
     async function onRequest(request, reply) {
-        const url = request.url.split('?')[0];
+        const url = request.routeOptions.url || '';
         if (!url.startsWith('/api/') && !url.startsWith('/data/')) return;
         if (url.startsWith('/api/auth/')) return;
-        if (!enabled()) return;
+        if (!authOn) return;
 
         const credentials = readCredentials();
         if (!credentials) {
@@ -148,7 +150,7 @@ export function createAuth(rootDir, dataPath) {
     }
 
     function status(request) {
-        const isEnabled = enabled();
+        const isEnabled = authOn;
         const credentials = readCredentials();
         const loggedIn = !!(isEnabled && credentials && currentSession(request, credentials));
         return {
@@ -180,7 +182,7 @@ export function createAuth(rootDir, dataPath) {
         if (typeof user === 'string' && typeof password === 'string') {
             const { hash } = await hashPassword(password, credentials.salt);
             const passwordOk = sameHex(hash, credentials.hash);
-            const userOk = crypto.timingSafeEqual(sha256(user), sha256(credentials.user));
+            const userOk = crypto.timingSafeEqual(sha256(user.trim()), sha256(credentials.user));
             valid = passwordOk && userOk;
         }
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# tun.monitor <mode> <tun> <host> <port> <port_range> <in_face> <public_ip> <out_face> <weight> <tunnel_count>
+# tun.monitor <mode> <tun> <host> <port> <port_range> <in_face> <public_ip> <out_face> <weight> <tunnel_count> <config>
 
 if [ -z "${DATA_PATH}" ]; then
     echo "Error: DATA_PATH environment variable is not set. Do not run this script directly."
@@ -27,6 +27,7 @@ if [[ ! -t 0 ]]; then
 fi
 
 CIPHER="${TUNNEL_CIPHER}"
+RUN_DIR="/run/tunnelcontrol"
 LOCAL_PEER="10.${TUN}.${TUN}.1"
 REMOTE_PEER="10.${TUN}.${TUN}.2"
 PINGPONG_INTERVAL=${TUNNEL_PINGPONG_INTERVAL}
@@ -35,9 +36,7 @@ TUNNEL_SOCKET="${DATA_PATH}/tun_ssh_${TUN}.sock"
 TUNNEL_STATE="${DATA_PATH}/tun_state_${TUN}"
 TUNNEL_START_CONNECT_TIME="${DATA_PATH}/tun_start_connect_time_${TUN}"
 TUNNEL_LAST_ROTATE_TIME="${DATA_PATH}/tun_last_rotate_${TUN}"
-TUNNEL_CONNECT_PROCESS="${DATA_PATH}/tun_connect_process_${TUN}"
 TUNNEL_EXIT_CODE="${DATA_PATH}/tun_ssh_exit_code_${TUN}"
-TUNNEL_REMOTE_SSHD_PID="${DATA_PATH}/tun_remote_sshd_pid_${TUN}"
 TUNNEL_CONNECT_DURATION="${DATA_PATH}/tun_connect_duration_${TUN}"
 TUNNEL_HOST="${DATA_PATH}/tun_host_${TUN}"
 TUNNEL_PINGPONG_LOCK="${DATA_PATH}/tun_pingpong_lock_${TUN}"
@@ -64,6 +63,11 @@ CONFIGURED=false
 LAST_PINGPONG=0
 OFFLINE_SINCE=0
 LAST_VPS_PROBLEMS=""
+
+write_file() {
+    local tmp="${1%/*}/.${1##*/}.tmp"
+    printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$1"
+}
 
 is_online() {
     if [ -f "${TUNNEL_STATE}" ]; then
@@ -94,16 +98,12 @@ is_offline() {
 }
 
 tunnel_kill() {
-    local skip_remote_kill=${1:-0}
+    local mode=${1:-${TUNNEL_KILL_MODE}}
 
     if [ -S "${TUNNEL_SOCKET}" ]; then
-        if [ "${skip_remote_kill}" -eq 0 ]; then
-            if [ "${REMOTE_SSHD_PID}" -ne 0 ]; then
-                LOG INFO "[${TUN}] Killing remote SSH tunnel process with PID ${REMOTE_SSHD_PID}"
-                tunnel_cmd "kill -9 ${REMOTE_SSHD_PID}" 2>/dev/null || true
-            else
-                LOG INFO "[${TUN}] Remote SSH tunnel PID not known, attempting to kill via control socket"
-            fi
+        if [ "${mode}" = "remote" ] && [ "${REMOTE_SSHD_PID}" -ne 0 ]; then
+            LOG INFO "[${TUN}] Killing remote SSH tunnel process with PID ${REMOTE_SSHD_PID}"
+            tunnel_cmd "kill -9 ${REMOTE_SSHD_PID}" "${TUNNEL_CMD_TIMEOUT}" 255 > /dev/null 2>&1 || true
         fi
 
         ssh -S "${TUNNEL_SOCKET}" -O exit root@"${HOST}" 2>/dev/null || true
@@ -113,11 +113,14 @@ tunnel_kill() {
     pkill -f "${TUNNEL_SOCKET}" 2>/dev/null || true
     pkill -f "ssh: ${TUNNEL_SOCKET} \[mux\]" 2>/dev/null || true
     pkill -f "ssh -w ${TUN}:${TUN}" 2>/dev/null || true
+    
+    REMOTE_SSHD_PID=0
 }
 
 tunnel_cmd() {
     local cmd=$1
     local timeout_sec=${2:-${TUNNEL_CMD_TIMEOUT}}
+    local expected_code=${3:-}
 
     LOG DEBUG "[${TUN}] tunnel_cmd: [${timeout_sec}s]: \"${cmd}\""
 
@@ -149,6 +152,9 @@ tunnel_cmd() {
         0)
             LOG DEBUG "[${TUN}] tunnel_cmd OK : \"${cmd}\""
             ;;
+        "${expected_code}")
+            LOG DEBUG "[${TUN}] tunnel_cmd ended with the expected code ${ret}: \"${cmd}\""
+            ;;
         *)
             LOG WARN "[${TUN}] tunnel_cmd FAILED (code=$ret): \"${cmd}\". Output: \"${output}\""
             ;;
@@ -158,11 +164,21 @@ tunnel_cmd() {
     return $ret
 }
 
+free_remote_tunnel() {
+    local output freed
+
+    output=$(tunnel_cmd "TUN_FREE=1 exec bash ${RUN_DIR}/tun.start ${TUN}" 2>/dev/null) || return 1
+    freed=$(sed -n 's/^VPS-FREED: //p' <<< "$output" | paste -sd ' ')
+    [ -n "$freed" ] || return 1
+    LOG WARN "[${TUN}] VPS ${HOST}: tun${TUN} was held by an old SSH session (sshd ${freed}), killed it, reconnecting now"
+    return 0
+}
+
 report_missing_tunnel() {
     local output problems line
 
-    if output=$(tunnel_cmd "TUN_CHECK=1 /tmp/tun.start" 2>/dev/null); then
-        problems=$(grep '^VPS-PROBLEM: ' <<< "$output" | cut -d' ' -f2-)
+    if output=$(tunnel_cmd "TUN_CHECK=1 bash ${RUN_DIR}/tun.start" 2>/dev/null); then
+        problems=$(grep -E '^VPS-(PROBLEM|FATAL): ' <<< "$output" | cut -d' ' -f2-)
         [ -n "$problems" ] || problems="no problems found by the VPS self-check"
     else
         problems="VPS self-check could not be run, the SSH session is already closed"
@@ -227,22 +243,22 @@ configure_routing() {
     LOG INFO "[${TUN}] New state transition detected: ${current_state} for ${HOST}"
 
     exec 201>"${HOST_LOCK}"
-    if ! flock -n 201; then
+    if [ "${force}" -eq 1 ]; then
+        flock -w 60 201 || LOG WARN "[${TUN}] Host lock still busy after 60s, configuring the tunnel anyway"
+    elif ! flock -n 201; then
         LOG DEBUG "[${TUN}] Another tunnel is handling the transition, skipping"
         return 0
     fi
 
     LOG INFO "[${TUN}] Acquired lock — performing routing reconfiguration"
 
-    if [ "${current_state}" = "DISABLED" ]; then
+    if [ "${force}" -eq 1 ] || { [ "${current_state}" != "DISABLED" ] && [ -f "${TUNNEL_REMOVED}" ]; }; then
+        ./tun.post.balance "${TUN}" "${LOCAL_PEER}" "${REMOTE_PEER}" "${WEIGHT}" "${TUNNEL_COUNT}" "${CONFIG}" 2>/dev/null || true
+        rm -f "${TUNNEL_REMOVED}" 2>/dev/null || true
+    elif [ "${current_state}" = "DISABLED" ]; then
         ./tun.post.balance.routing "remove" "${TUN}" "${TUNNEL_COUNT}" "${CONFIG}" 2>/dev/null || true
     else
-        if [ "${force}" -eq 1 ] || [ -f "${TUNNEL_REMOVED}" ]; then
-            ./tun.post.balance "${TUN}" "${LOCAL_PEER}" "${REMOTE_PEER}" "${WEIGHT}" "${TUNNEL_COUNT}" "${CONFIG}" 2>/dev/null || true
-            rm -f "${TUNNEL_REMOVED}" 2>/dev/null || true
-        else
-            ./tun.post.balance.routing "add" "${TUN}" "${TUNNEL_COUNT}" "${CONFIG}" 2>/dev/null || true
-        fi
+        ./tun.post.balance.routing "add" "${TUN}" "${TUNNEL_COUNT}" "${CONFIG}" 2>/dev/null || true
     fi
 
     echo "${current_state}:$(date +%s)" > "${HOST_LAST_EVENT}"
@@ -254,12 +270,11 @@ configure_routing() {
 
 LOG INFO "[${TUN}] Monitor started for ${HOST} (mode: ${MODE}, weight: ${WEIGHT:-N/A}), Log level: ${LOG_LEVEL:-1}"
 
-pkill -f "ssh -w ${TUN}:${TUN}" 2>/dev/null || true
-tunnel_kill
+tunnel_kill local
 
 NOW=$(date +%s)
 echo "${NOW}" > "${TUNNEL_START_CONNECT_TIME}"
-echo "${NOW}" > "${TUNNEL_LAST_ROTATE_TIME}"
+write_file "${TUNNEL_LAST_ROTATE_TIME}" "${NOW}"
 
 sleep $((TUN * 2))
 
@@ -273,7 +288,14 @@ while true; do
         if [ ! -s "${TUNNEL_STOP}" ]; then
             LOG INFO "[${TUN}] Stop signal detected. Stopping tunnel..."
 
-            tunnel_kill 1
+            tunnel_kill
+            NOW=$(date +%s)
+            if [ "$(is_online)" -eq 1 ]; then
+                LOG INFO "[${TUN}] Channel went offline"
+                write_file "${TUNNELS_LAST_OFFLINE_TIME}" "${NOW}:${TUN}"
+                OFFLINE_SINCE=${NOW}
+            fi
+            write_file "${TUNNEL_STATE}" "OFFLINE:${NOW}"
             echo "0" > "${TUNNEL_STOP}"
         fi
 
@@ -310,7 +332,7 @@ while true; do
             LOG INFO "[${TUN}] Host not ready, waiting..."
             LOG_NOTREADY=1
         fi
-        if [ -f "${DATA_PATH}/tun_host_${HOST}_busy" ]; then
+        if [ -f "${DATA_PATH}/tun_host_${HOST}_held" ]; then
             rm -f "${TUNNEL_STATE}" "${TUNNEL_HOST}"
         fi
         sleep 1
@@ -321,26 +343,28 @@ while true; do
         NOW=$(date +%s)
 
         STATE=$(is_online)
-        if [ "${STATE}" -ne 0 ]; then
+        if [ "${STATE}" -eq 1 ]; then
             LOG INFO "[${TUN}] Channel went offline"
-            echo "${NOW}:${TUN}" > "${TUNNELS_LAST_OFFLINE_TIME}"
+            write_file "${TUNNELS_LAST_OFFLINE_TIME}" "${NOW}:${TUN}"
             OFFLINE_SINCE=${NOW}
         fi
 
-        echo "OFFLINE:${NOW}" > "${TUNNEL_STATE}"
+        write_file "${TUNNEL_STATE}" "OFFLINE:${NOW}"
+
+        if [ "${STATE}" -eq 1 ]; then
+            ./tun.post.balance.routing "remove" "${TUN}" "${TUNNEL_COUNT}" "${CONFIG}" 2>/dev/null || true
+        fi
 
         IFS='-' read -r MIN MAX <<< "${PORT_RANGE}"
         RANDOM_PORT=$((MIN + ((RANDOM << 15) | RANDOM) % (MAX - MIN + 1)))
 
         LOG INFO "[${TUN}] tunnel not found. Restarting to ${HOST}:${RANDOM_PORT}..."
 
-        tunnel_kill 1
-
-        echo 1 > "${TUNNEL_CONNECT_PROCESS}"
+        tunnel_kill
 
         rm -f "$TUNNEL_SOCKET" "${TUNNEL_SOCKET}.lock" 2>/dev/null || true
 
-        echo "${HOST}:${RANDOM_PORT}:${PUBLIC_IP}" > "${TUNNEL_HOST}"
+        write_file "${TUNNEL_HOST}" "${HOST}:${RANDOM_PORT}:${PUBLIC_IP}"
 
         ssh \
             -w "$TUN:$TUN" \
@@ -372,24 +396,11 @@ while true; do
                 LOG ERROR "[${TUN}] Host key of ${HOST} does not match ${KNOWN_HOSTS}. If the VPS was reinstalled, remove the old key: ssh-keygen -R ${HOST} -f ${KNOWN_HOSTS}"
             fi
 
-            case $SSH_EXIT_CODE in
-                255)
-                    LOG ERROR "[${TUN}] Connection refused, timeout or network unreachable"
-                    ;;
-                1)
-                    LOG ERROR "[${TUN}] SSH protocol error or authentication failed"
-                    ;;
-                2)
-                    LOG ERROR "[${TUN}] Command line error"
-                    ;;
-                *)
-                    LOG ERROR "[${TUN}] Unknown SSH error"
-                    ;;
-            esac
+            SSH_ERROR=$(grep -v '^Warning: Permanently added' "${TUNNEL_SSH_ERR}" 2>/dev/null | tail -n 1)
+            LOG ERROR "[${TUN}] ${SSH_ERROR:-ssh printed no error message}"
 
-            echo "${SSH_EXIT_CODE}" > "${TUNNEL_EXIT_CODE}"
+            write_file "${TUNNEL_EXIT_CODE}" "${SSH_EXIT_CODE}"
 
-            rm -f "${TUNNEL_CONNECT_PROCESS}" 2>/dev/null || true
             rm -f "${TUNNEL_SOCKET}" 2>/dev/null || true
 
             sleep ${TUNNEL_RETRY_DELAY} # Wait before the next attempt to avoid restarting too often when the network or the remote host has problems
@@ -398,7 +409,6 @@ while true; do
 
             rm -f "${HOST_EXIT_CODE}" 2>/dev/null || true
             rm -f "${TUNNEL_EXIT_CODE}" 2>/dev/null || true
-            rm -f "${TUNNEL_CONNECT_PROCESS}" 2>/dev/null || true
 
             for _ in 1 2 3 4 5; do
                 ip link show "tun${TUN}" > /dev/null 2>&1 && break
@@ -407,9 +417,12 @@ while true; do
 
             if ip link show "tun${TUN}" > /dev/null 2>&1; then
                 LAST_VPS_PROBLEMS=""
+            elif free_remote_tunnel; then
+                tunnel_kill local
             else
                 report_missing_tunnel
-                tunnel_kill 1
+                write_file "${TUNNEL_EXIT_CODE}" 255
+                tunnel_kill local
                 sleep ${TUNNEL_RETRY_DELAY}
             fi
         fi
@@ -420,11 +433,20 @@ while true; do
         CONFIGURED=false
     else
         if [ "${CONFIGURED}" = false ]; then
-            RESULT=$(tunnel_cmd "exec /tmp/tun.start ${TUN} ${IN_FACE} NA NA ${PUBLIC_IP} ${OUT_FACE} ${LOCAL_PEER} ${REMOTE_PEER} ${TUNNEL_MTU}")
+            RESULT=$(tunnel_cmd "exec bash ${RUN_DIR}/tun.start ${TUN} ${IN_FACE} NA NA ${PUBLIC_IP} ${OUT_FACE} ${LOCAL_PEER} ${REMOTE_PEER} ${TUNNEL_MTU}")
             REMOTE_SSHD_PID=$(echo "${RESULT}" | grep -o "PID:[0-9]*" | cut -d: -f2)
-            LOG INFO "[${TUN}] Remote SSH tunnel PID: ${REMOTE_SSHD_PID}"
 
-            echo "${REMOTE_SSHD_PID}" > "${TUNNEL_REMOTE_SSHD_PID}"
+            if [ -z "${REMOTE_SSHD_PID}" ]; then
+                LOG ERROR "[${TUN}] VPS ${HOST} did not set up its end of tun${TUN}. Reconnecting in ${TUNNEL_RETRY_DELAY}s"
+                LOG DEBUG "[${TUN}] VPS answer: ${RESULT//$'\n'/; }"
+                
+                write_file "${TUNNEL_EXIT_CODE}" 255
+                tunnel_kill local
+                sleep ${TUNNEL_RETRY_DELAY}
+                continue
+            fi
+
+            LOG INFO "[${TUN}] Remote SSH tunnel PID: ${REMOTE_SSHD_PID}"
 
             LOG INFO "[${TUN}] Configuring tunnel..."
 
@@ -440,11 +462,15 @@ while true; do
 
             STATE=$(is_offline)
             if [ "${STATE}" -ne 0 ]; then
-                LOG INFO "[${TUN}] Channel came back online"
-                echo "${NOW}:${TUN}" > "${TUNNELS_LAST_ONLINE_TIME}"
+                if [ "${OFFLINE_SINCE}" -eq 0 ]; then
+                    LOG INFO "[${TUN}] Channel is online"
+                else
+                    LOG INFO "[${TUN}] Channel came back online"
+                fi
+                write_file "${TUNNELS_LAST_ONLINE_TIME}" "${NOW}:${TUN}"
             fi
 
-            echo "ONLINE:${NOW}" > "${TUNNEL_STATE}"
+            write_file "${TUNNEL_STATE}" "ONLINE:${NOW}"
 
             START_CONNECT_TIME=$(cat "${TUNNEL_START_CONNECT_TIME}" 2>/dev/null || echo "0")
             [ "${OFFLINE_SINCE}" -gt "${START_CONNECT_TIME}" ] && START_CONNECT_TIME=${OFFLINE_SINCE}
@@ -461,7 +487,7 @@ while true; do
         else
             if [ -S "${TUNNEL_SOCKET}" ]; then
                 if check_control_socket; then
-                    LOG DEBUG "[${TUN}] SSH control socket is healthy ${PINGPONG_IN_PROGRESS}"
+                    LOG DEBUG "[${TUN}] SSH control socket is healthy"
 
                     NOW=$(date +%s)
     
@@ -482,7 +508,9 @@ while true; do
                             PING_SIZE_2=$(( RANDOM % 49 + 48 ))
 
                             ping "$REMOTE_PEER" -c 1 -s "$PING_SIZE_1" -W 3 2>/dev/null || true
-                            tunnel_cmd "ping ${LOCAL_PEER} -c 1 -s $PING_SIZE_2 -W 3 2>/dev/null || true" 5 2>/dev/null || true
+                            if [ -S "${TUNNEL_SOCKET}" ] && [ ! -f "${TUNNEL_STOP}" ] && [ ! -f "${TUNNELS_STOP}" ]; then
+                                tunnel_cmd "ping ${LOCAL_PEER} -c 1 -s $PING_SIZE_2 -W 3 2>/dev/null || true" 5 255 2>/dev/null || true
+                            fi
 
                             LOG DEBUG "[${TUN}] Ping-pong completed"
                             rm -f "${TUNNEL_PINGPONG_LOCK}" 2>/dev/null || true
@@ -492,7 +520,7 @@ while true; do
                     fi
                 else
                     LOG WARN "[${TUN}] SSH control socket is not responsive. Restarting tunnel..."
-                    tunnel_kill 1
+                    tunnel_kill local
                 fi
             else
                 LOG DEBUG "[${TUN}] No control socket yet (normal on first start)"

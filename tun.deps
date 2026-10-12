@@ -7,8 +7,10 @@ if [ -z "${DATA_PATH}" ]; then
 fi
 
 source ./tun.logger
+source ./tun.env
 
 MODE=${1:-check}
+ROUTING=route
 NS="tun-deps-$$"
 DEPS_FAILED=0
 DEPS_QUIET=0
@@ -51,16 +53,31 @@ missing_packages() {
     done | sort -u
 }
 
+apt_lock_busy() {
+    local lock
+    for lock in /var/lib/apt/lists/lock /var/lib/dpkg/lock-frontend; do
+        [ -e "$lock" ] && grep -q ":$(stat -c %i "$lock") " /proc/locks && return 0
+    done
+    return 1
+}
+
 apt_progress() {
     local label=$1 line pct verb eta status
     local eta_re='\(([^)]*remaining)\)'
     local -a field
     shift
+    if [ "${1:-}" = update ]; then
+        local waited=0
+        while [ "$waited" -lt 300 ] && apt_lock_busy; do
+            sleep 5
+            waited=$((waited + 5))
+        done
+    fi
     if [ ! -t 1 ]; then
-        DEBIAN_FRONTEND=noninteractive apt-get -qq "$@" > /dev/null 2>&1
+        DEBIAN_FRONTEND=noninteractive apt-get -qq -o DPkg::Lock::Timeout=300 "$@" > /dev/null 2>&1
         return
     fi
-    DEBIAN_FRONTEND=noninteractive apt-get -o APT::Status-Fd=3 "$@" 3>&1 > /dev/null 2>&1 | while IFS= read -r line; do
+    DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=300 -o APT::Status-Fd=3 "$@" 3>&1 > /dev/null 2>&1 | while IFS= read -r line; do
         IFS=: read -ra field <<< "$line"
         case "${field[0]:-}" in
             dlstatus) verb=Downloading; pct=${field[2]:-} ;;
@@ -107,6 +124,7 @@ probe_kernel() {
         nexthop via 10.9.1.2 dev t0 weight 1 nexthop via 10.9.2.2 dev t1 weight 1
     probe "iptables conntrack match" iptables -I FORWARD 1 -o t0 -m conntrack --ctstate NEW -j DROP
     probe "iptables MASQUERADE" iptables -t nat -A POSTROUTING -s 10.0.0.0/8 ! -d 10.0.0.0/8 -o t0 -j MASQUERADE
+    probe "iptables TCPMSS" iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
     probe "conntrack table access" conntrack -L
 
     probe "tc tbf qdisc" tc qdisc add dev t0 root handle 1: tbf rate 1mbit burst 32kbit latency 50ms
@@ -117,17 +135,33 @@ probe_kernel() {
         u32 match u32 0 0 flowid 1:1 action mirred egress redirect dev ifb0
 }
 
+check_routing() {
+    ROUTING=route
+    [ "${TUNNEL_ROUTING}" = "route" ] && return
+    if ip netns exec "$NS" ip link add nh0 type dummy >/dev/null 2>&1 \
+        && ip netns exec "$NS" ip link set nh0 up >/dev/null 2>&1 \
+        && ip netns exec "$NS" ip addr add 10.9.9.1/32 peer 10.9.9.2/32 dev nh0 >/dev/null 2>&1 \
+        && ip netns exec "$NS" ip nexthop add id 3001 via 10.9.9.2 dev nh0 >/dev/null 2>&1 \
+        && ip netns exec "$NS" ip nexthop add id 3000 group 3001 type resilient buckets 8 >/dev/null 2>&1 \
+        && ip netns exec "$NS" ip route replace default table 301 nhid 3000 >/dev/null 2>&1; then
+        ROUTING=group
+    elif [ "${TUNNEL_ROUTING}" = "group" ]; then
+        deps_fail "resilient nexthop groups not available (TUNNEL_ROUTING=group); set TUNNEL_ROUTING=auto or route"
+    fi
+}
+
 check_kernel() {
     local out
 
     [ -c /dev/net/tun ] || deps_fail "/dev/net/tun not found, ssh -w cannot create tunnels"
 
     if ! out=$(ip netns add "$NS" 2>&1); then
-        deps_fail "cannot create a test network namespace, kernel features not checked: ${out}"
+        deps_fail "cannot create a test network namespace to check the kernel features: ${out}"
         return
     fi
 
     probe_kernel
+    check_routing
     ip netns del "$NS" 2>/dev/null || true
 }
 
@@ -154,6 +188,7 @@ if [ "$DEPS_FAILED" -eq 0 ]; then
         if [ "$DEPS_FAILED" -ne 0 ]; then
             KERNEL_EXTRA="linux-modules-extra-$(uname -r)"
             LOG NOTICE "Some kernel features are missing, trying to install ${KERNEL_EXTRA}"
+            apt_progress "package lists" update || LOG WARN "apt-get update failed, installing with the current package lists"
             apt_progress "$KERNEL_EXTRA" install -y "$KERNEL_EXTRA" || LOG WARN "Package ${KERNEL_EXTRA} could not be installed"
             DEPS_FAILED=0
         fi
@@ -166,4 +201,5 @@ if [ "$DEPS_FAILED" -ne 0 ]; then
     exit 1
 fi
 
-LOG NOTICE "Dependencies OK"
+echo "$ROUTING" > "${DATA_PATH}/tun_routing_mode"
+LOG INFO "Dependencies OK, client route: ${ROUTING}"

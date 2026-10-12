@@ -15,6 +15,10 @@ async function probe(url, options, timeoutMs) {
 }
 
 export async function checkCertificateTrust(timeoutMs = 5000) {
+    if (location.protocol !== 'https:') {
+        return { trusted: null, error: 'the panel is open over HTTP, it uses no certificate' };
+    }
+
     const panelError = await probe('/cert.pem', { method: 'HEAD' }, timeoutMs);
     if (panelError) {
         return { trusted: null, error: `panel not reachable, ${panelError}` };
@@ -46,10 +50,37 @@ export function certificateInstallSteps() {
             'Reopen the panel.'
         ];
     }
+    const ua = navigator.userAgent;
+    const firefoxSteps = 'Firefox: Settings → Privacy & Security → Certificates → View Certificates → Authorities → ' +
+        'Import → <b>Trust this CA to identify websites</b>. If you accepted the warning for the panel before, ' +
+        `delete <b>${location.host}</b> on the Servers tab of the same window, then restart Firefox.`;
+    if (/Windows/.test(ua)) {
+        return [
+            'Click Download Certificate and open the file.',
+            'Install Certificate → <b>Local Machine</b> → Place all certificates in the following store → ' +
+                '<b>Trusted Root Certification Authorities</b>. Firefox reads only the Local Machine store.',
+            'Restart the browser fully: in Chrome open <b>chrome://restart</b> (in Edge edge://restart); closing its ' +
+                'windows is not enough, it keeps running in the background. If Firefox still warns: ' + firefoxSteps
+        ];
+    }
+    if (/Firefox\//.test(ua)) {
+        return [
+            'Click Download Certificate.',
+            firefoxSteps,
+            'Reload the panel.'
+        ];
+    }
+    if (/Macintosh/.test(ua)) {
+        return [
+            'Click Download Certificate and open the file: it goes to Keychain Access.',
+            'Double-click the certificate → Trust → When using this certificate: <b>Always Trust</b>.',
+            'Restart the browser fully: in Chrome open <b>chrome://restart</b>.'
+        ];
+    }
     return [
         'Click Download Certificate.',
-        'Import it as a <b>trusted root certificate</b> (Windows: Trusted Root Certification Authorities).',
-        'Restart the browser.'
+        'Import it as a <b>trusted root certificate</b> of the system.',
+        'Restart the browser fully: in Chrome open <b>chrome://restart</b>.'
     ];
 }
 

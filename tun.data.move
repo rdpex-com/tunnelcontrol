@@ -24,6 +24,7 @@ DATA_ITEMS=(
     "total_speed_history.log*"
     "web_auth.json"
     "web_sessions.json"
+    "web_settings_hash"
 )
 
 SYSTEM_DIRS=(/ /tmp /var/tmp /dev/shm /run /mnt /media /srv /opt /home /root /var /etc /usr)

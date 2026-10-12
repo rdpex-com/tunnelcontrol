@@ -7,7 +7,7 @@ function configuredHosts() {
     const hosts = new Set();
     try {
         const content = fs.readFileSync(path.join(ROOT_DIR, 'tun.config'), 'utf-8');
-        for (const match of content.matchAll(/^\s*"([^":\s]+):/gm)) {
+        for (const match of content.matchAll(/^\s*["']?(\d+\.\d+\.\d+\.\d+):/gm)) {
             hosts.add(match[1]);
         }
     } catch (err) {
@@ -16,7 +16,7 @@ function configuredHosts() {
     return hosts;
 }
 
-function getActiveEnabledHostsCount() {
+function getActiveEnabledHosts() {
     try {
         const uniqueActiveHosts = new Set();
         const stateFiles = fs.readdirSync(DATA_PATH).filter(f => f.startsWith('tun_state_'));
@@ -35,11 +35,23 @@ function getActiveEnabledHostsCount() {
             }
         }
 
-        return uniqueActiveHosts.size;
+        return uniqueActiveHosts;
     } catch (e) {
         console.error('Error counting active hosts:', e);
-        return 1;
+        return null;
     }
+}
+
+function otherEnabledHostsCount(host) {
+    let count = 0;
+    for (const entry of configuredHosts()) {
+        if (entry === host) continue;
+        if (fs.existsSync(path.join(DATA_PATH, `tun_host_${entry}_held`))) continue;
+        if (!fs.existsSync(path.join(DATA_PATH, `tun_host_${entry}_loaded`))) continue;
+        if (fs.existsSync(path.join(DATA_PATH, `tun_host_${entry}_enabled`))
+            || !fs.existsSync(path.join(DATA_PATH, `tun_host_${entry}_disabled`))) count++;
+    }
+    return count;
 }
 
 export default async function hostsRoutes(app) {
@@ -54,7 +66,10 @@ export default async function hostsRoutes(app) {
 
             const currentlyEnabled = fs.existsSync(enabledFile) || !fs.existsSync(disabledFile);
 
-            if (currentlyEnabled && getActiveEnabledHostsCount() <= 1) {
+            const activeHosts = currentlyEnabled ? getActiveEnabledHosts() : null;
+            if (currentlyEnabled && (!activeHosts
+                    || otherEnabledHostsCount(host) === 0
+                    || (activeHosts.has(host) && activeHosts.size === 1))) {
                 return {
                     success: false,
                     error: 'Cannot disable the last active host. At least one host must remain enabled.'

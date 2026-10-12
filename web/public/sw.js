@@ -1,4 +1,4 @@
-const VER = '1.3.261008.234225';
+const VER = '1.3.261012.163127';
 const CACHE_NAME = 'tunnel-control-v' + VER;
 const DYNAMIC_CACHE = 'tunnel-dynamic-v' + VER;
 const skipCache = false;
@@ -7,12 +7,17 @@ const STATIC_ASSETS = [
     '/',
     '/index.html',
     '/login.html',
-    '/manifest.json',
-    '/favicon.png',
+    '/img/favicon.ico',
+    '/img/icon-192.png',
+    '/img/icon-512.png',
+    '/img/icon-mono-512.png',
+    '/img/icon-mono-96.png',
+    '/img/apple-touch-icon.png',
+    '/img/mark-color.webp',
+    '/img/mark-mask.webp',
     '/css/style.css',
     '/css/fontawesome.min.css',
     '/js/tailwind.min.js',
-    '/js/htmx.min.js',
     '/js/chart.umd.min.js',
     '/js/app/platform-early.js',
     '/js/app/cert-check.js',
@@ -27,14 +32,6 @@ const STATIC_ASSETS = [
     '/js/app/service.js',
     '/js/app/ui.js',
     '/js/app/utils.js',
-    '/img/favicon64.png',
-    '/img/favicon64w.png',
-    '/img/favicon256.png',
-    '/img/favicon256w.png',
-    '/img/favicon512.png',
-    '/img/favicon512w.png',
-    '/img/image256.png',
-    '/img/image512.png',
     '/webfonts/fa-brands-400.woff2',
     '/webfonts/fa-brands-400.ttf',
     '/webfonts/fa-regular-400.woff2',
@@ -155,6 +152,10 @@ self.addEventListener('fetch', (event) => {
         return;
     }
 
+    if (url.pathname === '/manifest.json') {
+        return;
+    }
+
     if (method !== 'GET' || url.pathname === '/cert.pem') {
         event.respondWith(fetch(event.request));
         return;
@@ -249,8 +250,8 @@ self.addEventListener('push', (event) => {
 
     const options = {
         body: data.body || 'New notification from Tunnel Control',
-        icon: '/img/image512.png',
-        badge: '/img/favicon256.png',
+        icon: '/img/icon-192.png',
+        badge: '/img/icon-mono-96.png',
         vibrate: [200, 100, 200],
         data: {
             url: data.url || '/'

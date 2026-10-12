@@ -173,26 +173,16 @@ html.dark * {
     margin-top: 30px !important;
 }
 
-html {
-    color-scheme: light only !important;
-}
-
-@media (prefers-color-scheme: dark) {
-    .dark\:* {
-        all: unset !important;
-    }
-}
-
 .desktop .custom-tooltip {
     position: fixed;           /* ← important: fixed, not absolute */
     pointer-events: none;
-    background: #1f2937;
-    border: 1px solid #4b5563;
+    background: #ffffff;
+    border: 1px solid #d1d5db;
     border-radius: 6px;
     padding: 10px 14px;
-    color: #e5e7eb;
+    color: #4b5563;
     font-size: 13px;
-    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.3);
+    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.1);
     display: none;
     z-index: 1000;            /* higher */
     width: auto;              /* auto works better */
@@ -208,12 +198,22 @@ html {
     min-width: 50%;
     max-width: 60%;
     pointer-events: none;
-    color: #e5e7eb;
+    color: #4b5563;
     font-size: 13px;
     display: none;
     z-index: 100;
     align-items: anchor-center;
     margin-bottom: -8px;
+}
+
+.dark .custom-tooltip {
+    color: #e5e7eb;
+}
+
+.dark.desktop .custom-tooltip {
+    background: #1f2937;
+    border-color: #4b5563;
+    box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.3);
 }
 
 #background-overlay {
@@ -247,4 +247,18 @@ html {
 
 .mobile:not(.layout-ready) #content-container {
     visibility: hidden;
+}
+
+.mobile #main-title {
+    font-size: 1.5rem;
+}
+
+.mobile #app-version {
+    font-size: 0.75rem;
+    line-height: 1rem;
+}
+
+.mobile .header-mark {
+    width: 46px;
+    height: 46px;
 }

@@ -29,7 +29,7 @@ To keep it running in the background, start it as a transient systemd unit, watc
 stop it with `systemctl`:
 
 ```bash
-systemd-run --unit tunnelcontrol-vps-traffic /usr/local/bin/tunnelcontrol-vps-traffic
+systemd-run --unit tunnelcontrol-vps-traffic --collect /usr/local/bin/tunnelcontrol-vps-traffic
 journalctl -fu tunnelcontrol-vps-traffic
 systemctl stop tunnelcontrol-vps-traffic
 ```

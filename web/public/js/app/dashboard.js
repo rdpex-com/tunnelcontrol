@@ -221,7 +221,7 @@ function initChart() {
                 legend: {
                     display: true,
                     position: 'top',
-                    labels: { color: '#e5e7eb', boxWidth: 12, padding: 15 }
+                    labels: { color: '#9ca3af', boxWidth: 12, padding: 15 }
                 },
                 tooltip: {
                     enabled: false,
@@ -267,7 +267,7 @@ function initChart() {
                                 <div style="display:flex; align-items:center; gap:8px; margin:3px 0;">
                                     <span style="color:${point.dataset.borderColor}; font-size:16px;">●</span>
                                     <span>${point.dataset.label}:</span>
-                                    <span style="margin-left:auto; font-weight:600; color:#e5e7eb;">
+                                    <span style="margin-left:auto; font-weight:600;">
                                         ${formatSpeed(point.raw)}
                                     </span>
                                 </div>
@@ -525,7 +525,7 @@ window.toggleHost = async function(host, checkbox) {
         }
     } catch (e) {
         console.error(e);
-        window.showToast("Failed to toggle host");
+        window.showToast("Failed to toggle host", 'error');
         checkbox.checked = !checkbox.checked;
     }
 };

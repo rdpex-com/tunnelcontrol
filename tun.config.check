@@ -6,8 +6,17 @@ cd "$(dirname "$(readlink -f "$0")")" || exit 1
 
 SETTINGS=$(grep -oE '^[A-Z][A-Z0-9_]*=' ./tun.defaults | tr -d '=' | paste -sd '|')
 NAME_RE="^(CONFIG|DATA_PATH|${SETTINGS})\$"
-VALUE_RE="(\"[^\"\$\`\\\\]*\"|'[^']*'|[A-Za-z0-9._:/+-]*)"
+VALUE_RE="(\"[^\"\$\`\\\\]*\"|'[^']*'|[A-Za-z0-9._:/+@%,=-]*)"
 COMMENT_RE="([[:space:]]+#.*)?[[:space:]]*"
+TOKEN_RE="^[[:space:]]*(\"[^\"]*\"|'[^']*'|[A-Za-z0-9._:/+@%,=-]+)(.*)\$"
+
+OCTET='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+IPV4_RE="^(${OCTET}\\.){3}${OCTET}\$"
+IFACE_RE='^[A-Za-z0-9._@-]{1,15}$'
+HOSTNAME_RE='^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+RATE_RE='^[0-9]+(\.[0-9]+)?([kmgt]?(bit|bps))?$'
+SIZE_RE='^[0-9]+(\.[0-9]+)?([kmg]?(bit|b)|[kmg])?$'
+TIME_RE='^[0-9]+(\.[0-9]+)?(s|sec|secs|ms|msec|msecs|us|usec|usecs)?$'
 
 if [ ! -f "$FILE" ]; then
     echo "${FILE} not found"
@@ -16,11 +25,162 @@ fi
 
 ERRORS=0
 IN_ARRAY=0
+BROKEN_ARRAY=""
 N=0
+TUNNEL_ENTRIES=0
+declare -A SEEN
 
 error() {
     echo "line ${N}: $*"
     ERRORS=1
+}
+
+unquote() {
+    local value=$1
+
+    if [[ $value == \"*\" || $value == \'*\' ]]; then
+        value=${value:1:-1}
+    fi
+
+    printf '%s' "$value"
+}
+
+in_range() {
+    [[ $1 =~ ^(0|[1-9][0-9]{0,8})$ ]] && [ "$((10#$1))" -ge "$2" ] && [ "$((10#$1))" -le "$3" ]
+}
+
+check_tunnel() {
+    local entry=$1 host port range in_iface public_ip out_iface weight extra low high
+
+    TUNNEL_ENTRIES=$((TUNNEL_ENTRIES + 1))
+    IFS=':' read -r host port range in_iface public_ip out_iface weight extra <<< "$entry"
+
+    if [ -n "$extra" ] || [ -z "$weight" ]; then
+        error "TUNNELS entry must have 7 fields HOST:PORT:PORT_RANGE:IN_IFACE:PUBLIC_IP:OUT_IFACE:WEIGHT: ${entry}"
+        return
+    fi
+
+    [[ $host =~ $IPV4_RE ]] || error "TUNNELS HOST must be an IPv4 address: ${host}"
+    in_range "$port" 1 65535 || error "TUNNELS PORT must be a port number 1-65535: ${port}"
+
+    low=${range%%-*}
+    high=${range#*-}
+    if [[ $range != *-* ]] || ! in_range "$low" 1 65535 || ! in_range "$high" 1 65535 || [ "$((10#$low))" -gt "$((10#$high))" ]; then
+        error "TUNNELS PORT_RANGE must be LOW-HIGH with ports 1-65535 and LOW not above HIGH: ${range}"
+    fi
+
+    [[ $in_iface =~ $IFACE_RE ]] || error "TUNNELS IN_IFACE must be an interface name: ${in_iface}"
+
+    if [ "$public_ip" != "NA" ] && ! [[ $public_ip =~ $IPV4_RE ]]; then
+        error "TUNNELS PUBLIC_IP must be an IPv4 address or NA: ${public_ip}"
+    fi
+
+    if [ "$out_iface" != "NA" ] && ! [[ $out_iface =~ $IFACE_RE ]]; then
+        error "TUNNELS OUT_IFACE must be an interface name or NA: ${out_iface}"
+    elif [ "$public_ip" != "NA" ] && [ "$out_iface" = "NA" ]; then
+        error "TUNNELS OUT_IFACE must name the interface of PUBLIC_IP ${public_ip}, not NA"
+    fi
+
+    in_range "$weight" 1 256 || error "TUNNELS WEIGHT must be a number 1-256: ${weight}"
+}
+
+check_value() {
+    local name=$1 value=$2 iface network prefix
+
+    case $name in
+        CONFIG)
+            iface=${value%%:*}
+            network=${value#*:}
+            prefix=${network#*/}
+            if [[ $value != *:* ]] || ! [[ $iface =~ $IFACE_RE ]] || [[ $network != */* ]] \
+                || ! [[ ${network%/*} =~ $IPV4_RE ]] || ! in_range "$prefix" 0 32; then
+                error "CONFIG must be INTERFACE:NETWORK/PREFIX, for example eth0:192.168.0.0/16: ${value}"
+            fi
+            ;;
+        WEB_CONFIG_BACKUP_PATH)
+            [ -z "$value" ] || [[ $value =~ ^[A-Za-z0-9._/+-]+$ ]] || error "WEB_CONFIG_BACKUP_PATH must be empty or a path of letters, digits and . _ / + -: ${value}"
+            ;;
+        DATA_PATH|LOG_VPS_FILE)
+            [[ $value =~ ^[A-Za-z0-9._/+-]+$ ]] || error "${name} must be a path of letters, digits and . _ / + -: ${value}"
+            [ "$name" = LOG_VPS_FILE ] && [[ $value != /* ]] && error "LOG_VPS_FILE must be an absolute path: ${value}"
+            [ "$name" = LOG_VPS_FILE ] && [[ $value == */ ]] && error "LOG_VPS_FILE must be a file, not a folder ending with /: ${value}"
+            ;;
+        LOG_LEVEL)
+            in_range "$value" 0 3 || error "LOG_LEVEL must be 0, 1, 2 or 3: ${value}"
+            ;;
+        MANAGER_WATCHDOG)
+            [[ $value =~ ^(true|false)$ ]] || error "MANAGER_WATCHDOG must be true or false: ${value}"
+            ;;
+        MANAGER_STOP_TIMEOUT)
+            in_range "$value" 1 89 || error "MANAGER_STOP_TIMEOUT must be 1-89 seconds, less than TimeoutStopSec=90s of tun.service: ${value}"
+            ;;
+        TUNNEL_KILL_MODE)
+            [[ $value =~ ^(local|remote)$ ]] || error "TUNNEL_KILL_MODE must be local or remote: ${value}"
+            ;;
+        TUNNEL_ROUTING)
+            [[ $value =~ ^(auto|group|route)$ ]] || error "TUNNEL_ROUTING must be auto, group or route: ${value}"
+            ;;
+        TUNNEL_CIPHER)
+            [[ $value =~ ^[A-Za-z0-9@.,_-]+$ ]] || error "TUNNEL_CIPHER must be an ssh cipher name: ${value}"
+            ;;
+        TUNNEL_MTU)
+            in_range "$value" 576 9000 || error "TUNNEL_MTU must be 576-9000: ${value}"
+            ;;
+        WEB_CERT_SITE_DAYS)
+            in_range "$value" 31 999999999 || error "WEB_CERT_SITE_DAYS must be more than 30 days, the site certificate is renewed 30 days before its end: ${value}"
+            ;;
+        MANAGER_SETUP_TIMEOUT)
+            in_range "$value" 120 999999999 || error "MANAGER_SETUP_TIMEOUT must be at least 120 seconds (a setup waits up to a minute for a busy VPS and longer for apt): ${value}"
+            ;;
+        MANAGER_WARN_THROTTLE|TUNNEL_CONNECT_TIMEOUT|TUNNEL_ALIVE_INTERVAL|TUNNEL_ALIVE_COUNT|TUNNEL_RETRY_DELAY|TUNNEL_CMD_TIMEOUT|TUNNEL_PINGPONG_INTERVAL|ROTATION_CYCLE_COUNT|ROTATION_MIN_UNIQUE_HOSTS|WEB_CERT_DAYS)
+            in_range "$value" 1 999999999 || error "${name} must be a whole number from 1: ${value}"
+            ;;
+        LOG_VPS_MAX_KB|ROTATION_DELAY|ROTATION_MIN_CHANNEL_INTERVAL|ROTATION_MIN_STABLE_TIME|ROTATION_DRAIN_TIMEOUT|ROTATION_DRAIN_GRACE|ROTATION_DRAIN_THRESHOLD)
+            in_range "$value" 0 999999999 || error "${name} must be a whole number from 0: ${value}"
+            ;;
+        ROTATION_ACTIVE_HOSTS_ONLY|WEB_PANEL|WEB_AUTH|WEB_HTTPS|WEB_PUSH|WEB_PUSH_LOGOUT_UNSUBSCRIBE)
+            [[ $value =~ ^[01]$ ]] || error "${name} must be 0 or 1: ${value}"
+            ;;
+        ROTATION_ON_DRAIN_TIMEOUT)
+            [[ $value =~ ^(force|skip)$ ]] || error "ROTATION_ON_DRAIN_TIMEOUT must be force or skip: ${value}"
+            ;;
+        SHAPING_RATE)
+            [[ $value =~ $RATE_RE ]] || error "SHAPING_RATE must be a tc rate, for example 105mbit: ${value}"
+            ;;
+        SHAPING_BURST)
+            [[ $value =~ $SIZE_RE ]] || error "SHAPING_BURST must be a tc size, for example 1mbit: ${value}"
+            ;;
+        SHAPING_LATENCY)
+            [[ $value =~ $TIME_RE ]] || error "SHAPING_LATENCY must be a tc time, for example 50ms: ${value}"
+            ;;
+        SHAPING_DEFAULT_WEIGHT)
+            in_range "$value" 1 256 || error "SHAPING_DEFAULT_WEIGHT must be 1-256: ${value}"
+            ;;
+        WEB_LISTEN)
+            [[ $value =~ $IPV4_RE ]] || error "WEB_LISTEN must be an IPv4 address: ${value}"
+            ;;
+        WEB_HTTPS_PORT)
+            in_range "$value" 1 65534 || error "WEB_HTTPS_PORT must be 1-65534, the next port is the certificate check: ${value}"
+            ;;
+        WEB_HTTP_PORT)
+            in_range "$value" 1 65535 || error "WEB_HTTP_PORT must be a port number 1-65535: ${value}"
+            ;;
+        WEB_PUSH_EMAIL)
+            [[ $value =~ ^[^@[:space:]]+@[^@[:space:]]+$ ]] || error "WEB_PUSH_EMAIL must be an e-mail address: ${value}"
+            ;;
+        WEB_APP_NAME)
+            [ "${#value}" -le 48 ] || error "WEB_APP_NAME must be at most 48 characters: ${value}"
+            [[ $value =~ [$'\x01'-$'\x1f'$'\x7f'/:*?\<\>|] ]] && error "WEB_APP_NAME must not contain control characters or / : * ? < > |: ${value}"
+            ;;
+        WEB_CERT_ADDRESS)
+            if [ -n "$value" ] && ! [[ $value =~ $IPV4_RE || $value =~ $HOSTNAME_RE ]]; then
+                error "WEB_CERT_ADDRESS must be empty, an IPv4 address or a host name: ${value}"
+            fi
+            ;;
+        UPDATE_URL)
+            [[ $value =~ ^https?://[^[:space:]]+$ ]] || error "UPDATE_URL must be an http or https address: ${value}"
+            ;;
+    esac
 }
 
 while IFS= read -r LINE || [ -n "$LINE" ]; do
@@ -33,26 +193,58 @@ while IFS= read -r LINE || [ -n "$LINE" ]; do
 
     LINE="${LINE#"${LINE%%[![:space:]]*}"}"
     [ -z "$LINE" ] && continue
+    [ "$IN_ARRAY" -eq 1 ] && [ -n "$BROKEN_ARRAY" ] && error "the TUNNELS block is broken: nothing may follow TUNNELS=( on line ${BROKEN_ARRAY}"
     [[ $LINE == \#* ]] && continue
 
     if [ "$IN_ARRAY" -eq 1 ]; then
         if [[ $LINE =~ ^\)${COMMENT_RE}$ ]]; then
             IN_ARRAY=0
+            BROKEN_ARRAY=""
         elif ! [[ $LINE =~ ^${VALUE_RE}([[:space:]]+${VALUE_RE})*${COMMENT_RE}$ ]]; then
             error "not a plain quoted value inside TUNNELS: ${LINE}"
+        else
+            REST=$LINE
+            COUNT=0
+            while [[ $REST =~ $TOKEN_RE ]]; do
+                REST=${BASH_REMATCH[2]}
+                COUNT=$((COUNT + 1))
+                check_tunnel "$(unquote "${BASH_REMATCH[1]}")"
+            done
+            [ "$COUNT" -gt 1 ] && error "one TUNNELS entry per line: ${LINE}"
         fi
         continue
     fi
 
-    if [[ $LINE =~ ^TUNNELS=\(${COMMENT_RE}$ ]]; then
+    if [[ $LINE =~ ^TUNNELS=\( ]]; then
         IN_ARRAY=1
+        if ! [[ $LINE =~ ^TUNNELS=\(${COMMENT_RE}$ ]]; then
+            BROKEN_ARRAY=$N
+            error "nothing may follow TUNNELS=( on its line: ${LINE}"
+        fi
+        if [ -n "${SEEN[TUNNELS]:-}" ]; then
+            error "TUNNELS is set twice (first on line ${SEEN[TUNNELS]})"
+        else
+            SEEN[TUNNELS]=$N
+        fi
     elif [[ $LINE =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
         NAME=${BASH_REMATCH[1]}
         VALUE=${BASH_REMATCH[2]}
+        if [ -n "${SEEN[$NAME]:-}" ]; then
+            error "${NAME} is set twice (first on line ${SEEN[$NAME]})"
+            continue
+        fi
+        SEEN[$NAME]=$N
         if ! [[ $NAME =~ $NAME_RE ]]; then
             error "unknown variable ${NAME}"
         elif ! [[ $VALUE =~ ^${VALUE_RE}${COMMENT_RE}$ ]]; then
-            error "value of ${NAME} must be plain text without \$, \`, \\ or nested quotes: ${VALUE}"
+            case $VALUE in
+                *'$'*|*'`'*|*'\'*|*'"'*|*"'"*)
+                    error "value of ${NAME} must be plain text without \$, \`, \\ or nested quotes: ${VALUE}" ;;
+                *)
+                    error "value of ${NAME} must be in quotes: ${VALUE}" ;;
+            esac
+        else
+            check_value "$NAME" "$(unquote "${BASH_REMATCH[1]}")"
         fi
     else
         error "only variable assignments and comments are allowed: ${LINE}"
@@ -61,6 +253,18 @@ done < "$FILE"
 
 if [ "$IN_ARRAY" -eq 1 ]; then
     error "TUNNELS=( is not closed with )"
+fi
+
+if [ -z "${SEEN[CONFIG]:-}" ]; then
+    echo "CONFIG is missing: the local network as INTERFACE:NETWORK/PREFIX, for example eth0:192.168.0.0/16"
+    ERRORS=1
+fi
+if [ -z "${SEEN[TUNNELS]:-}" ]; then
+    echo "TUNNELS is missing: one line per channel, HOST:PORT:PORT_RANGE:IN_IFACE:PUBLIC_IP:OUT_IFACE:WEIGHT"
+    ERRORS=1
+elif [ "$TUNNEL_ENTRIES" -eq 0 ]; then
+    echo "TUNNELS has no channel: add at least one line HOST:PORT:PORT_RANGE:IN_IFACE:PUBLIC_IP:OUT_IFACE:WEIGHT"
+    ERRORS=1
 fi
 
 exit "$ERRORS"
