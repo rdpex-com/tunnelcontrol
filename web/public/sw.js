@@ -1,4 +1,4 @@
-const VER = '1.3.261013.120238';
+const VER = '261013.150507';
 const CACHE_NAME = 'tunnel-control-v' + VER;
 const DYNAMIC_CACHE = 'tunnel-dynamic-v' + VER;
 const skipCache = false;

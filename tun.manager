@@ -42,6 +42,25 @@ write_file() {
     printf '%s\n' "$2" > "$tmp" && mv -f "$tmp" "$1"
 }
 
+check_update() {
+    local latest current
+    latest=$(curl -fsSL --max-time 20 "${UPDATE_URL}/VERSION" 2>/dev/null | tr -d '[:space:]')
+    if ! [[ $latest =~ ^[0-9]+(\.[0-9]+)+$ ]]; then
+        LOG INFO "Update check: no version from ${UPDATE_URL}"
+        return
+    fi
+    write_file "${DATA_PATH}/tun_latest_version" "$latest"
+    current=$(cat ./VERSION 2>/dev/null)
+    [ "$latest" != "$current" ] && [ "$(printf '%s\n' "$current" "$latest" | sort -V | tail -n 1)" = "$latest" ] || return
+    [ "$(cat "${DATA_PATH}/tun_latest_notified" 2>/dev/null)" = "$latest" ] && return
+    write_file "${DATA_PATH}/tun_latest_notified" "$latest"
+    LOG NOTICE "Tunnel Control ${latest} is available (installed ${current}): run tun --update"
+    if [ "${WEB_PANEL}" != "0" ] && [ "${WEB_PUSH}" != "0" ]; then
+        mkdir -p "${DATA_PATH}/queue"
+        echo "Tunnel Control ${latest} is available: run tun --update" > "${DATA_PATH}/queue/message_$(date +%s%N).notify"
+    fi
+}
+
 check_stop() {
     if [ -f "${STOP_FILE}" ]; then
         LOG INFO "Skipping by external signal..."
@@ -213,8 +232,16 @@ TEST_PID=$!
         start_setup "$HOST" initial
     done
 
+    [ "${UPDATE_CHECK}" = "1" ] || rm -f "${DATA_PATH}/tun_latest_version"
+    NEXT_UPDATE_CHECK=$(( $(uptime_seconds) + 60 ))
+
     while true; do
         check_stop
+
+        if [ "${UPDATE_CHECK}" = "1" ] && [ ! -d .git ] && [ -n "${UPDATE_URL}" ] && [ "$(uptime_seconds)" -ge "$NEXT_UPDATE_CHECK" ]; then
+            NEXT_UPDATE_CHECK=$(( $(uptime_seconds) + 86400 ))
+            check_update &
+        fi
 
         for HOST in "${!SETUP_PID[@]}"; do
             if kill -0 "${SETUP_PID[$HOST]}" 2>/dev/null; then

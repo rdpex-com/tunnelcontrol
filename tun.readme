@@ -35,7 +35,10 @@ tun --update        # update: from git (git pull) or, when installed with instal
                     # until tun --install is run by hand);
                     # only the code is replaced, tun.config, tun.server.setup.<VPS IP>, data and bak/ are not touched;
                     # an archive install keeps the list of release files in .release-files, and an update
-                    # removes the files that left the release (from git, git itself does that)
+                    # removes the files that left the release (from git, git itself does that);
+                    # once a day the server asks UPDATE_URL for the latest release (UPDATE_CHECK=1, not for
+                    # installs from git) and tells about a newer one: a panel banner (Hide closes it for that
+                    # version), Update on the System tab and in tun --status, one push notification
 tun --version       # installed version
 tun --help          # this list of commands; tun without a command or with an unknown one prints it too
 tun --status        # whether the tunnels run from the console or as the tun service, the service, the web panel,

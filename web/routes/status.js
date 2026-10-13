@@ -3,6 +3,15 @@ import path from 'path';
 import { DATA_PATH, ROOT_DIR } from '../paths.js';
 import { readCleanFile } from '../helpers.js';
 
+function isNewer(candidate, current) {
+    const a = candidate.split('.').map(Number);
+    const b = (current || '').split('.').map(Number);
+    for (let i = 0; i < Math.max(a.length, b.length); i++) {
+        if ((a[i] || 0) !== (b[i] || 0)) return (a[i] || 0) > (b[i] || 0);
+    }
+    return false;
+}
+
 function parseState(content) {
     if (!content) return { status: 'UNKNOWN', timestamp: null };
     const parts = content.split(':');
@@ -158,7 +167,9 @@ export default async function statusRoutes(app) {
 
     app.get('/api/version', async () => {
         try {
-            return { success: true, version: fs.readFileSync(path.join(ROOT_DIR, 'VERSION'), 'utf-8').trim() };
+            const version = fs.readFileSync(path.join(ROOT_DIR, 'VERSION'), 'utf-8').trim();
+            const latest = readCleanFile(path.join(DATA_PATH, 'tun_latest_version'));
+            return { success: true, version, latest: /^\d+(\.\d+)+$/.test(latest || '') && isNewer(latest, version) ? latest : null };
         } catch (err) {
             return { success: false, error: err.message };
         }

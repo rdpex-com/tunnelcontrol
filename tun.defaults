@@ -67,3 +67,4 @@ WEB_CERT_SITE_DAYS=825               # validity of the site certificate it issue
 
 # ---------- UPDATE ----------
 UPDATE_URL="https://github.com/rdpex-com/tunnelcontrol/releases/latest/download"   # where tun --update gets the release (VERSION and tunnelcontrol.tar.gz) when not installed from git
+UPDATE_CHECK=1                       # 1 = once a day ask UPDATE_URL for the latest release and tell about a newer one (panel banner and System tab, tun --status, a push notification); 0 = never; installs from git are not checked

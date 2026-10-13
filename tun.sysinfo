@@ -42,8 +42,19 @@ if [[ "$1" == "once" || "$1" == "-1" || "$1" == "--once" ]]; then
     }')
     disk=$(df -h / | awk 'NR==2 {printf "%s/%s (%s)", $3, $2, $5}')
 
-    printf "CPU: %s%% | RAM: %s | Disk: %s | %s\n" \
-        "$cpu_load" "$ram" "$disk" "$GUESTINFO"
+    update=""
+    dir=$(dirname "$(readlink -f "$0")")
+    data=$(cat "${dir}/.data_path" 2>/dev/null || echo ./data)
+    [[ $data == /* ]] || data="${dir}/${data#./}"
+    latest=$(cat "${data}/tun_latest_version" 2>/dev/null)
+    current=$(cat "${dir}/VERSION" 2>/dev/null)
+    if [[ $latest =~ ^[0-9]+(\.[0-9]+)+$ ]] && [ "$latest" != "$current" ] \
+        && [ "$(printf '%s\n' "$current" "$latest" | sort -V | tail -n 1)" = "$latest" ]; then
+        update=" | Update: ${latest} available, run tun --update"
+    fi
+
+    printf "CPU: %s%% | RAM: %s | Disk: %s | %s%s\n" \
+        "$cpu_load" "$ram" "$disk" "$GUESTINFO" "$update"
 else
     watch -n 1 --no-title --color "$0 --once"
 fi

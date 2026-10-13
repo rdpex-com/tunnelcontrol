@@ -24,7 +24,7 @@ function updateVersion() {
             const minute = String(now.getMinutes()).padStart(2, '0');
             const second = String(now.getSeconds()).padStart(2, '0');
 
-            const newVersion = `1.3.${year}${month}${day}.${hour}${minute}${second}`;
+            const newVersion = `${year}${month}${day}.${hour}${minute}${second}`;
 
             const match = content.match(/const VER = ['"](.*?)['"]/);
             const oldVersion = match ? match[1] : 'unknown';

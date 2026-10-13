@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 — 2026-10-13
+
+### Install, update, settings
+
+- The server asks for the latest release once a day (`UPDATE_CHECK`) and tells about a newer one: a
+  panel banner that Hide closes for that version, a line on the System tab and in `tun --status`, and one
+  push notification.
+
 ## 0.2.1 — 2026-10-13
 
 ### Security

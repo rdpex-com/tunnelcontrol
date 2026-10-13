@@ -58,7 +58,10 @@ missing, and a VPS only has to accept a root SSH login once, for the initial set
   notifications. HTTPS with a certificate you can install on your devices. Optional: a console-only
   install uses `tun --status` and `tun --monitor` instead.
 - **Updates keep your data.** `tun --update` replaces only the code and removes the files that left
-  the release; `tun.config`, the per-VPS setup files, `data/` and `bak/` are never touched.
+  the release; `tun.config`, the per-VPS setup files, `data/` and `bak/` are never touched. Once a day
+  the server asks for the latest release and tells about a newer one: a banner in the panel (Hide
+  closes it for that version), a line on the System tab and in `tun --status`, and one push
+  notification (`UPDATE_CHECK=0` turns this off; installs from git are not checked).
 
 ## Requirements
 
@@ -331,7 +334,7 @@ each of them, and in what format, is in [docs/data-files.md](docs/data-files.md)
 
 ## Status
 
-Version 0.2.1 — early. It is developed and run on Debian and Ubuntu; nothing else has been tested.
+Version 0.2.2 — early. It is developed and run on Debian and Ubuntu; nothing else has been tested.
 The changes of each release are in [CHANGELOG.md](CHANGELOG.md).
 Issues and pull requests are welcome.
 

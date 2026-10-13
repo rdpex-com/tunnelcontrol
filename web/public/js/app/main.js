@@ -714,6 +714,47 @@ function showUpdateBanner() {
     }
 }
 
+function showReleaseBanner(latest) {
+    try {
+        if (localStorage.getItem('releaseBannerHidden') === latest) return;
+    } catch (e) {}
+    if (document.getElementById('release-banner')) return;
+
+    const banner = document.createElement('div');
+    banner.id = 'release-banner';
+    banner.className = `
+        fixed bottom-4 left-1/2 transform -translate-x-1/2
+        bg-blue-600 text-white
+        px-5 py-4 rounded-3xl shadow-2xl
+        flex flex-col sm:flex-row items-center gap-3
+        max-w-md w-fit min-w-[280px] z-[100000]
+    `.trim();
+    banner.innerHTML = `
+        <span class="text-center sm:text-left flex-1 px-1">
+            <span class="block font-medium whitespace-nowrap">Tunnel Control <span data-release></span> is available</span>
+            <span class="block text-sm opacity-90 whitespace-nowrap">Update the server: <span class="font-mono">tun --update</span></span>
+        </span>
+        <button onclick="window.hideReleaseBanner()"
+                class="bg-white text-blue-600 hover:bg-gray-100
+                    px-6 py-2.5 rounded-2xl font-semibold text-sm
+                    whitespace-nowrap flex-shrink-0">
+            Hide
+        </button>
+    `;
+    banner.querySelector('[data-release]').textContent = latest;
+    banner.dataset.latest = latest;
+    document.body.appendChild(banner);
+}
+
+window.hideReleaseBanner = function() {
+    const banner = document.getElementById('release-banner');
+    if (!banner) return;
+    try {
+        localStorage.setItem('releaseBannerHidden', banner.dataset.latest);
+    } catch (e) {}
+    banner.remove();
+};
+
 async function showCertificateBanner() {
     if (document.getElementById('cert-banner')) return;
     const features = (await pushIsOff()) ? 'updates and offline mode' : 'updates, push notifications and offline mode';
@@ -838,6 +879,7 @@ async function showVersion(appVersion) {
             try {
                 const data = await (await fetch('/api/version')).json();
                 if (data.success && data.version) coreVersion = data.version;
+                if (data.success && data.latest) showReleaseBanner(data.latest);
             } catch (e) {
                 logDebug('[App] Failed to get the version', e.message);
             }
