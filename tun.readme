@@ -12,7 +12,7 @@ curl -fsSL https://tunnelcontrol.app/install.sh | bash
                     # from the example; another folder: ... | TUNNELCONTROL_DIR=/path bash
                     # then fill in CONFIG and TUNNELS in tun.config and run tun --install
 git clone https://github.com/rdpex-com/tunnelcontrol.git /opt/tunnelcontrol && /opt/tunnelcontrol/tun --install
-                    # the same from git; the first tun --install creates tun.config and the tun command, then stops
+                    # the same as a copy of the repository; the first tun --install creates tun.config and the tun command, then stops
 WEB_PANEL=0         # in tun.config before tun --install: console only, without the web panel and Node.js
 
 
@@ -29,15 +29,15 @@ tun --kill          # immediate stop of the tunnels
 tun --web-password  # set the web panel login and password (signs out every panel session)
 tun --web-cert      # new panel certificate authority and site certificate; install the new certificate on
                     # every device again (Download Certificate in the panel)
-tun --update        # update: from git (git pull) or, when installed with install.sh, from GitHub: compares VERSION
-                    # and downloads the archive (UPDATE_URL) when the latest release differs from the installed version, then runs tun --install
+tun --update        # update to the latest release: compares VERSION with UPDATE_URL and downloads the archive when
+                    # the latest release differs from the installed version (a copy of the repository takes its latest code instead), then runs tun --install
                     # without questions (no e-mail, no root password: a VPS that needs its first setup is held off
-                    # until tun --install is run by hand);
+                    # until tun --install is run by hand); tunnels that were stopped before the update stay stopped;
                     # only the code is replaced, tun.config, tun.server.setup.<VPS IP>, data and bak/ are not touched;
                     # an archive install keeps the list of release files in .release-files, and an update
-                    # removes the files that left the release (from git, git itself does that);
+                    # removes the files that left the release (a copy of the repository updates its files itself);
                     # once a day the server asks UPDATE_URL for the latest release (UPDATE_CHECK=1, not for
-                    # installs from git) and tells about a newer one: a panel banner (Hide closes it for that
+                    # copies of the repository) and tells about a newer one: a panel banner (Hide closes it for that
                     # version), Update on the System tab and in tun --status, one push notification
 tun --version       # installed version
 tun --help          # this list of commands; tun without a command or with an unknown one prints it too

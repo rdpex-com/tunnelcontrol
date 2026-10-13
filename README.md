@@ -61,7 +61,7 @@ missing, and a VPS only has to accept a root SSH login once, for the initial set
   the release; `tun.config`, the per-VPS setup files, `data/` and `bak/` are never touched. Once a day
   the server asks for the latest release and tells about a newer one: a banner in the panel (Hide
   closes it for that version), a line on the System tab and in `tun --status`, and one push
-  notification (`UPDATE_CHECK=0` turns this off; installs from git are not checked).
+  notification (`UPDATE_CHECK=0` turns this off; copies of the repository are not checked).
 
 ## Requirements
 
@@ -105,7 +105,7 @@ creates `tun.config` from the example. For another folder:
 curl -fsSL https://tunnelcontrol.app/install.sh | TUNNELCONTROL_DIR=/srv/tunnelcontrol bash
 ```
 
-Or from git, which also makes `tun --update` a `git pull`:
+Or as a copy of the repository; `tun --update` then takes its latest code instead of the latest release:
 
 ```bash
 git clone https://github.com/rdpex-com/tunnelcontrol.git /opt/tunnelcontrol && /opt/tunnelcontrol/tun --install
@@ -135,7 +135,7 @@ before `tun --install`; `tun --status` and `tun --monitor` then show the state i
 | `tun --restart` | restart the tunnels |
 | `tun --stop` | graceful stop |
 | `tun --kill` | immediate stop |
-| `tun --update` | update the code: `git pull`, or the latest release from GitHub when installed with `install.sh`; `tun --install` runs afterwards |
+| `tun --update` | update to the latest release (a copy of the repository: to its latest code); `tun --install` runs afterwards, and tunnels that were stopped before stay stopped |
 | `tun --web-password` | set the panel login and password (signs out every open session) |
 | `tun --web-cert` | new panel certificate authority and site certificate; install the new certificate on every device again |
 | `tun --version` | installed version |

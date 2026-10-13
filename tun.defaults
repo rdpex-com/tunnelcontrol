@@ -66,5 +66,5 @@ WEB_CERT_DAYS=3650                   # validity of the panel certificate authori
 WEB_CERT_SITE_DAYS=825               # validity of the site certificate it issues, days (more than 30); renewed by the panel itself before the end, also while the tunnels run, and at a tunnel start when this value changed (iPhone and Mac reject site certificates of a private authority valid longer than 825 days)
 
 # ---------- UPDATE ----------
-UPDATE_URL="https://github.com/rdpex-com/tunnelcontrol/releases/latest/download"   # where tun --update gets the release (VERSION and tunnelcontrol.tar.gz) when not installed from git
-UPDATE_CHECK=1                       # 1 = once a day ask UPDATE_URL for the latest release and tell about a newer one (panel banner and System tab, tun --status, a push notification); 0 = never; installs from git are not checked
+UPDATE_URL="https://github.com/rdpex-com/tunnelcontrol/releases/latest/download"   # where tun --update gets the release (VERSION and tunnelcontrol.tar.gz) when not a copy of the repository
+UPDATE_CHECK=1                       # 1 = once a day ask UPDATE_URL for the latest release and tell about a newer one (panel banner and System tab, tun --status, a push notification); 0 = never; copies of the repository are not checked

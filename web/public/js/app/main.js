@@ -746,6 +746,20 @@ function showReleaseBanner(latest) {
     document.body.appendChild(banner);
 }
 
+async function checkRelease() {
+    try {
+        const data = await (await fetch('/api/version', { cache: 'no-store' })).json();
+        if (data.success && data.latest) showReleaseBanner(data.latest);
+    } catch (e) {
+        logDebug('[App] Failed to check the release', e.message);
+    }
+}
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') checkRelease();
+});
+setInterval(checkRelease, 60 * 60 * 1000);
+
 window.hideReleaseBanner = function() {
     const banner = document.getElementById('release-banner');
     if (!banner) return;

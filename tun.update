@@ -23,26 +23,30 @@ fail() {
 }
 
 if [ -d .git ]; then
-    LOG INFO "Update: checking the git repository..."
+    LOG INFO "Update: checking for a new version..."
 
-    git fetch --quiet || fail "git fetch failed"
-    UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || fail "the current branch has no upstream to update from"
+    git fetch --quiet || fail "cannot reach the source this copy was installed from"
+    UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null) || fail "this copy has no source to update from; it is updated where it was copied from, or reinstall with install.sh"
 
     if [ "$(git rev-parse HEAD)" = "$(git rev-parse "$UPSTREAM")" ]; then
-        LOG NOTICE "Update: already up to date ($(git log -1 --format=%h))"
+        LOG NOTICE "Update: already up to date ($(cat ./VERSION 2>/dev/null))"
         exit 0
     fi
 
-    git merge-base --is-ancestor HEAD "$UPSTREAM" || fail "local commits differ from ${UPSTREAM}, a fast-forward update is not possible"
-    git diff --quiet HEAD || fail "tracked files have local changes; commit or revert them first"
+    git merge-base --is-ancestor HEAD "$UPSTREAM" || fail "this copy has changes of its own that the source does not have; it cannot be updated automatically"
+    git diff --quiet HEAD || fail "files of this installation were changed by hand; restore them, then update again"
 
-    FROM=$(git log -1 --format=%h)
-    TO=$(git log -1 --format=%h "$UPSTREAM")
+    FROM=$(cat ./VERSION 2>/dev/null)
+    TO=$(git show "${UPSTREAM}:VERSION" 2>/dev/null)
+    if [ "$FROM" = "$TO" ]; then
+        FROM="${FROM} ($(git log -1 --format=%h))"
+        TO="${TO} ($(git log -1 --format=%h "$UPSTREAM"))"
+    fi
 
     date +%s > "${DATA_PATH}/tun_restarting"
     ./tun --stop < /dev/null > /dev/null 2>&1
 
-    git merge --ff-only --quiet "$UPSTREAM" || fail "git merge failed; run tun --install to start the tunnels again"
+    git merge --ff-only --quiet "$UPSTREAM" || fail "replacing the code failed; run tun --install to start the tunnels again"
     LOG NOTICE "Update: code updated ${FROM} -> ${TO}"
 else
     [ -n "${UPDATE_URL}" ] || fail "UPDATE_URL is empty"

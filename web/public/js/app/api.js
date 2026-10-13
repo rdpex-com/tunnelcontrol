@@ -148,6 +148,9 @@ export async function updateSysInfo(timeout = 10000) {
 
         const output = data.output.trim();
         const items = output.split('|').map(item => item.trim()).filter(Boolean);
+        const valueClass = (key) => key === 'Update'
+            ? 'px-2 py-0.5 rounded-lg border border-blue-500 text-blue-600 dark:text-blue-400'
+            : 'text-gray-900 dark:text-gray-100';
 
         if (Platform.isIOS() || Platform.isAndroid()) {
             let html = `<div class="grid grid-cols-2 gap-x-8 gap-y-2 text-sm">`;
@@ -156,7 +159,7 @@ export async function updateSysInfo(timeout = 10000) {
                 if (key && value) {
                     html += `
                         <div class="text-gray-500 dark:text-gray-400">${escapeHtml(key)}:</div>
-                        <div class="font-mono text-right text-gray-900 dark:text-gray-100">${escapeHtml(value)}</div>
+                        <div class="font-mono text-right ${valueClass(key)}">${escapeHtml(value)}</div>
                     `;
                 }
             });
@@ -169,7 +172,7 @@ export async function updateSysInfo(timeout = 10000) {
                 if (key && value) {
                     html += `
                         <span class="text-gray-500 dark:text-gray-400">${escapeHtml(key)}: </span>
-                        <span class="font-mono text-gray-900 dark:text-gray-100">${escapeHtml(value)}</span>
+                        <span class="font-mono ${valueClass(key)}">${escapeHtml(value)}</span>
                     `;
                 }
             });

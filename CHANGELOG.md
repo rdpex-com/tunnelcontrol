@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Web panel
+
+- An open panel or installed app shows the newer release banner without a reload: it asks again whenever
+  it is shown and once an hour.
+- The Update line on the System tab is framed, so it stands out from CPU, RAM and the temperatures.
+
+### Install, update, settings
+
+- `tun --update` speaks plain words, not git terms, and names the versions it updates between.
+- `tun --update` no longer starts tunnels that were stopped before the update.
+
 ## 0.2.2 — 2026-10-13
 
 ### Install, update, settings

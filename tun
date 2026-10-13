@@ -500,6 +500,12 @@ if [ "$1" = "--install" ]; then
     [ "${WEB_PANEL}" != "0" ] && WEB_RESTART=""
 fi
 
+if [ "$1" = "--install" ] && [ -n "${TUN_UPDATE:-}" ] && [ "${TUN_UPDATE_WAS_RUNNING:-}" != "1" ]; then
+    rm -f "${START_FILE}" "${DATA_PATH}/tun_restarting" 2>/dev/null || true
+    LOG NOTICE "The tunnels were stopped before the update, so they stay stopped: tun --start starts them"
+    exit 0
+fi
+
 if [ "${WEB_PANEL}" != "0" ] && systemctl is-active --quiet tun-web 2>/dev/null; then
     WEB_HASH=$(printf '%s\n' "${TUN_WEB_SETTINGS[@]}" | sha256sum | awk '{print $1}')
     if [ "$WEB_HASH" != "$(cat "${DATA_PATH}/web_settings_hash" 2>/dev/null)" ] && [ "$1" != "--install" ]; then
