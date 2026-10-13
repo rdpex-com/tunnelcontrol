@@ -45,6 +45,9 @@ else
     LOG WARN "logrotate is not installed, the logs in /var/log are not rotated"
 fi
 
+printf '%s\n' "net.ipv4.ip_forward = 0" > /etc/sysctl.d/99-tunnelcontrol.conf || { LOG ERROR "Failed to write /etc/sysctl.d/99-tunnelcontrol.conf"; exit 1; }
+LOG INFO "IP forwarding stays off at boot until tun sets up the firewall: /etc/sysctl.d/99-tunnelcontrol.conf"
+
 LOG NOTICE "Service ${SERVICE_NAME} installed and enabled."
 LOG INFO "Working directory: ${WORKING_DIR}"
 LOG INFO "To start: tun --start from the console, or as the service: systemctl restart ${SERVICE_NAME} (a stopped oneshot service can stay active), or reboot the system."

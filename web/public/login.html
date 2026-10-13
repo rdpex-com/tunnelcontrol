@@ -4,6 +4,12 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Tunnel Control Panel — Login</title>
+    <script>
+        fetch('/manifest.json', { cache: 'no-store' }).then(r => r.json()).then(m => {
+            const label = (m.name || '').replace(/^Tunnel Control\s*/, '');
+            if (label) document.title = document.title.replace('Tunnel Control Panel', `Tunnel Control Panel (${label})`);
+        }).catch(() => {});
+    </script>
 
     <script src="js/app/platform-early.js"></script>
     <script src="js/tailwind.min.js"></script>

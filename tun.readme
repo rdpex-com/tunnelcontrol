@@ -2,7 +2,7 @@ Installation (Debian or Ubuntu with systemd, as root)
 
 Use a clean server and clean VPS hosts that run nothing else: tun reconfigures them completely. On the server
 it resets iptables on every start, takes over the routing tables 50, 51, 100, 101 and up (one per channel), 200
-and 300, the rule priorities 50, 51, 90, 91, 100, 101 and 200 and the nexthop ids 3000-3999, turns on IP forwarding and turns off IPv6; on every VPS it changes sshd_config, adds its key for root, turns on IP forwarding, turns off IPv6 and resets
+and 300, the rule priorities 50, 51, 90, 91, 100, 101 and 200 and the nexthop ids 3000-3999, turns on IP forwarding (kept off at boot by /etc/sysctl.d/99-tunnelcontrol.conf, on only after its firewall) and turns off IPv6; on every VPS it changes sshd_config, adds its key for root, turns on IP forwarding, turns off IPv6 and resets
 iptables (see VPS below). After installation the network is configured so that the traffic of the local network
 never goes out directly again, only through the tunnels: while they are stopped, the clients have no internet,
 not even ping. The VPS hosts cannot open connections into the local network.

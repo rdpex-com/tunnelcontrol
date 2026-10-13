@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.2.1 — 2026-10-13
+
+### Security
+
+- After a reboot of the server, client traffic could go out directly for about a second while the tunnels
+  started: IP forwarding was turned on before the firewall. It is now turned on only after it, and
+  `tun --install` keeps it off at boot (`/etc/sysctl.d/99-tunnelcontrol.conf`).
+
+### Channels and routing
+
+- After a crash or hard reset of the server the channels come up without a minute of waiting: the server
+  keeps its session mark across a reboot, so the VPS hosts no longer take its old sessions for another
+  server's.
+
+### Web panel
+
+- The certificate file is named after the server address (`tun-panel-<address>.crt`), so the files of
+  several servers do not mix on a device.
+- The browser tab names the server: `Tunnel Control Panel (<WEB_APP_NAME>)`.
+
 ## 0.2.0 — 2026-10-12
 
 ### Security

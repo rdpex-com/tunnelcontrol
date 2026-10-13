@@ -7,6 +7,12 @@
     <meta name="screen-orientation" content="portrait">
 
     <title>Tunnel Control Panel</title>
+    <script>
+        fetch('/manifest.json', { cache: 'no-store' }).then(r => r.json()).then(m => {
+            const label = (m.name || '').replace(/^Tunnel Control\s*/, '');
+            if (label) document.title = document.title.replace('Tunnel Control Panel', `Tunnel Control Panel (${label})`);
+        }).catch(() => {});
+    </script>
 
     <script>
         window.online = true;

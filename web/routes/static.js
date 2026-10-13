@@ -1,4 +1,5 @@
 import fs from 'fs';
+import crypto from 'crypto';
 import os from 'os';
 import path from 'path';
 import fastifyStatic from '@fastify/static';
@@ -44,7 +45,9 @@ export default async function staticRoutes(app) {
             const authority = path.join(DATA_PATH, 'cert', 'ca.pem');
             const file = fs.existsSync(authority) ? authority : path.join(DATA_PATH, 'cert', 'fullchain.pem');
             const content = await fs.promises.readFile(file);
-            reply.header('Content-Disposition', 'attachment; filename="tun-panel.crt"');
+            const address = new crypto.X509Certificate(content).subject.match(/CA ([0-9A-Za-z.-]+)$/m)?.[1];
+            const name = address ? `tun-panel-${address}.crt` : 'tun-panel.crt';
+            reply.header('Content-Disposition', `attachment; filename="${name}"`);
             return reply.type('application/x-x509-ca-cert').send(content);
         } catch (err) {
             return reply.code(404).send({ success: false, error: 'Certificate not found' });

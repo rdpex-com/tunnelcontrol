@@ -22,7 +22,8 @@ missing, and a VPS only has to accept a root SSH login once, for the initial set
 >
 > - On the server it resets `iptables` on every start, takes over the routing tables 50, 51, 100,
 >   101 and up (one per channel), 200 and 300, the rule priorities 50, 51, 90, 91, 100, 101 and 200
->   and the nexthop ids 3000-3999, turns on IP forwarding and turns off IPv6.
+>   and the nexthop ids 3000-3999, turns on IP forwarding and turns off IPv6. IP forwarding is kept off
+>   at boot (`/etc/sysctl.d/99-tunnelcontrol.conf`) and turned on only after its firewall is in place.
 > - After installation the network is configured so that the traffic of the local network never
 >   goes out directly again, only through the tunnels: while they are stopped, the clients have no
 >   internet, not even ping. The VPS hosts cannot open connections into the local network.
@@ -330,7 +331,7 @@ each of them, and in what format, is in [docs/data-files.md](docs/data-files.md)
 
 ## Status
 
-Version 0.2.0 — early. It is developed and run on Debian and Ubuntu; nothing else has been tested.
+Version 0.2.1 — early. It is developed and run on Debian and Ubuntu; nothing else has been tested.
 The changes of each release are in [CHANGELOG.md](CHANGELOG.md).
 Issues and pull requests are welcome.
 

@@ -390,7 +390,6 @@ if [ "${WEB_PANEL}" != "0" ] && [ -f "${DATA_PATH}/cert/ca.key" ]; then
     fi
 fi
 
-sysctl -w net.ipv4.ip_forward=1 &>/dev/null || true
 sysctl -w net.ipv6.conf.all.disable_ipv6=1 &>/dev/null || true
 sysctl -w net.ipv6.conf.default.disable_ipv6=1 &>/dev/null || true
 sysctl -w net.ipv6.conf.lo.disable_ipv6=1 &>/dev/null || true
@@ -423,7 +422,6 @@ else
         CLEANUP_NEEDED=true
     fi
 fi
-
 
 SETUP_NEEDED=false
 
@@ -537,12 +535,20 @@ echo "$CONFIG_HASH" > "$CONFIG_HASH_FILE"
 LOG DEBUG "Current config hash: ${CONFIG_HASH:0:16}..."
 
 mkdir -p "${RUN_DIR}"
-[ -s "${SESSION_FILE}" ] || od -An -N8 -tx1 /dev/urandom | tr -d ' \n' > "${SESSION_FILE}"
+if [ ! -s "${SESSION_FILE}" ]; then
+    if [[ $(cat "${DATA_PATH}/tun_session" 2>/dev/null) =~ ^[0-9a-f]{16}$ ]]; then
+        cp -f "${DATA_PATH}/tun_session" "${SESSION_FILE}"
+    else
+        od -An -N8 -tx1 /dev/urandom | tr -d ' \n' > "${SESSION_FILE}"
+    fi
+fi
 cp -f "${SESSION_FILE}" "${DATA_PATH}/tun_session"
 LOG NOTICE "Session mark: $(cut -c1-8 "${SESSION_FILE}")"
 rm -f "${DATA_PATH}"/tun_host_*_held
 
 ./tun.firewall "${CONFIG}"
+
+sysctl -w net.ipv4.ip_forward=1 &>/dev/null || true
 
 sleep 3
 

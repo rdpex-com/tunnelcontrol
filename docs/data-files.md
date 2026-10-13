@@ -25,7 +25,7 @@ Two cleanups in `tun` decide how long a file lives:
 | `tun_restarting` | `tun --restart` and `--install`, `tun.update` before it stops the tunnels, panel Start and Restart | panel (`monitor.js`: no "stopped" notification while it is younger than 15 minutes) | epoch seconds | removed by `tun.manager` once every VPS has been tried |
 | `tun_stop` | `tun --stop` (not `--kill`) | every long-running script (existence = stop), panel (time of the stop) | epoch seconds | kept after the stop; removed at the next start |
 | `tun_stop_<N>` | `tun --stop`, `tun.rotation.scheduler` (empty = request); `tun.monitor` (`0` = done) | `tun.monitor`, `tun`, `tun.rotation.scheduler`, `tun.test` (its traffic monitor of the tunnel stops on `0`) | empty or `0` | removed by normal cleanup and after a rotation |
-| `tun_session` | `tun` (copy of `/run/tunnelcontrol/session`) | `tun.server.setup` (VPS busy mark) | 16 hex characters, no newline: `3fa91c0d7be24e58` | rewritten at every start |
+| `tun_session` | `tun` (copy of `/run/tunnelcontrol/session`) | `tun.server.setup` (VPS busy mark) | 16 hex characters, no newline: `3fa91c0d7be24e58` | rewritten at every start; after a reboot `tun` takes the mark back from it |
 | `tun_bytes_total_adjust` | `tun` (full cleanup) | `tun.test` (adds `tun_bytes_total` into the persisted total, then removes the file) | empty | until the next traffic monitor start |
 
 ### Tunnels
